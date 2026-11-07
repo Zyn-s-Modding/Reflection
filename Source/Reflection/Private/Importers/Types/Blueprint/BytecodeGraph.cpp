@@ -3332,8 +3332,10 @@ UK2Node* FBytecodeGraph::PlaceCall(const FUObjectJsonValueExport& Expression, UE
 
 	ChainExecution(Node);
 
-	/* Said where a call came back with nothing wired to it at all, which means it was laid down and
-	 * then left out of the graph: neither what it takes nor what it works out found anywhere to go */
+	/* Kept where a call has nothing wired to it yet. One that takes nothing but constants is wired
+	 * by whatever reads its answer, which is placed after it, and one reached by a jump is wired
+	 * when the jumps are tied up, so whether it was left out of the graph is asked once both have
+	 * happened rather than here. */
 	{
 		int32 Wired = 0;
 
@@ -3342,7 +3344,7 @@ UK2Node* FBytecodeGraph::PlaceCall(const FUObjectJsonValueExport& Expression, UE
 		}
 
 		if (Wired == 0) {
-			UE_LOG(LogReflectionBytecode, Warning, TEXT("\"%s\" was laid down with nothing wired to it"), *Function->GetName());
+			Unwired.Emplace(Node, Function->GetName());
 		}
 	}
 
@@ -3580,9 +3582,10 @@ void FBytecodeGraph::EnterNode(UK2Node* Node) {
 
 		Chained++;
 	} else {
-		UE_LOG(LogReflectionBytecode, Warning, TEXT("nothing leads into \"%s\""), *Node->GetName());
-
-		Orphaned++;
+		/* Not left out yet. Whatever is entered from a jump, or from a branch or sequence that goes
+		 * somewhere other than straight on, has nothing leading into it until the jumps are tied
+		 * up at the end, so it is asked again then. */
+		Unreached.Add(Node);
 	}
 }
 
@@ -6204,6 +6207,38 @@ int32 FBytecodeGraph::Build() {
 		}
 	}
 
+	/* What was really left out, now that everything that could lead into it has.
+	 *
+	 * Asked when each node was placed, every stretch the compiler laid down after a jump or a return
+	 * read as left out: the run had stopped there, and what reaches it is a jump tied up above.
+	 * MASTER_TODM came back whole and still said nine nodes had nothing leading into them, each a
+	 * jump's target, a branch's other way or a sequence's later thread. Asked here, what is said is
+	 * what the graph is saved with. Only nodes still in the graph count, since some are put back as
+	 * something else once they are laid down. */
+	for (const TWeakObjectPtr<UK2Node>& Node : Unreached) {
+		if (!Node.IsValid() || !Graph->Nodes.Contains(Node.Get())) continue;
+
+		const UEdGraphPin* In = WayIn(Node.Get());
+
+		if (In == nullptr || In->LinkedTo.Num() > 0) continue;
+
+		UE_LOG(LogReflectionBytecode, Warning, TEXT("nothing leads into \"%s\""), *Node->GetName());
+
+		Orphaned++;
+	}
+
+	/* And a call with nothing wired to it at all, which means it was laid down and then left out of
+	 * the graph: neither what it takes nor what it works out found anywhere to go */
+	for (const TPair<TWeakObjectPtr<UK2Node>, FString>& Call : Unwired) {
+		if (!Call.Key.IsValid() || !Graph->Nodes.Contains(Call.Key.Get())) continue;
+
+		const bool bWired = Call.Key->Pins.ContainsByPredicate([](const UEdGraphPin* Pin) { return Pin != nullptr && Pin->LinkedTo.Num() > 0; });
+
+		if (!bWired) {
+			UE_LOG(LogReflectionBytecode, Warning, TEXT("\"%s\" was laid down with nothing wired to it"), *Call.Value);
+		}
+	}
+
 	/* Put back whatever was written as one node before anything is laid out, so what is laid out is
 	 * what the reader will see */
 	if (bTidy) {
@@ -6358,7 +6393,10 @@ int32 FBytecodeGraph::Build() {
 		}
 	}
 
-	UE_LOG(LogReflectionBytecode, Display, TEXT("\"%s\": entered from %s, %d node(s) chained, %d left out of the run"), *Graph->GetName(), Flow != nullptr ? TEXT("a pin") : TEXT("nothing"), Chained, Orphaned);
+	/* Whether the run was ever entered, which is what the first node it reached says. Where the run
+	 * had got to by the last statement says nothing: a graph that ends in a return or a jump has
+	 * stopped there whether or not anything led into it. */
+	UE_LOG(LogReflectionBytecode, Display, TEXT("\"%s\": entered from %s, %d node(s) chained, %d left out of the run"), *Graph->GetName(), Start != nullptr ? TEXT("a pin") : TEXT("nothing"), Chained, Orphaned);
 
 	if (Contested.Num() > 0) {
 		UE_LOG(LogReflectionBytecode, Warning, TEXT("%d way(s) out were already spoken for: %s"), Contested.Num(), *FString::Join(Contested, TEXT(", ")));

@@ -473,5 +473,15 @@ private:
 	int32 Chained = 0;
 	int32 Orphaned = 0;
 
+	/* Nodes the run had not reached when they were laid down. Most are where a jump, a branch's
+	 * other way or a sequence's later thread lands, which are only tied up once everything is laid
+	 * down, so whether one was really left out is asked then rather than when it is placed. */
+	TArray<TWeakObjectPtr<UK2Node>> Unreached;
+
+	/* Calls laid down with nothing wired to them yet, and the function each one calls. What reads a
+	 * value is placed after what works it out, and a jump reaches a call later still, so these are
+	 * only said to be left out once everything has had its chance to wire into them. */
+	TArray<TPair<TWeakObjectPtr<UK2Node>, FString>> Unwired;
+
 	int32 LastChainedAddress = -1;
 };
