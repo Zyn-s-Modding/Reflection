@@ -64,6 +64,11 @@
 			"Name": "CurveExpression",
 			"Enabled": true,
 			"Optional": true
+		},
+		{
+			"Name": "RigLogic",
+			"Enabled": true,
+			"Optional": true
 		}
 	]
 }

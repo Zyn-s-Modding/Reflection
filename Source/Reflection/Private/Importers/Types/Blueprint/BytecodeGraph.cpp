@@ -6230,8 +6230,12 @@ int32 FBytecodeGraph::Build() {
 		for (UEdGraphNode* Node : Graph->Nodes) {
 			if (Node == nullptr || !Node->IsA<UK2Node_FunctionEntry>()) continue;
 
+			/* Only where the link was lost. The run was started from this very pin, so where nothing
+			 * rebuilt the first node the link is still there, and tying it again is no contest. */
 			if (UEdGraphPin* Then = Node->FindPin(UEdGraphSchema_K2::PN_Then, EGPD_Output)) {
-				LinkExecution(Then, Start);
+				if (!Then->LinkedTo.Contains(Start)) {
+					LinkExecution(Then, Start);
+				}
 			}
 
 			break;

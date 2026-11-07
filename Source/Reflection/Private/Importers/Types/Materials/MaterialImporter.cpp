@@ -1,6 +1,7 @@
 /* Copyright Reflection Contributors 2024-2026 */
 
 #include "Importers/Types/Materials/MaterialImporter.h"
+#include "RenderingThread.h"
 #include "Importers/Types/Materials/MaterialStubs.h"
 
 /* Include Material.h (depends on UE Version) */
@@ -29,6 +30,20 @@ public:
 #endif
 
 UObject* IMaterialImporter::CreateAsset(UObject* CreatedAsset) {
+	/* Reflected again over one that is already loaded.
+	 *
+	 * The factory would build the new material in the old one's memory, tearing it down underneath
+	 * every component still drawing with it. Those keep pointing at a render proxy that no longer
+	 * exists, and the next time the scene caches their draw commands it calls through it and the
+	 * editor goes down on a render worker. The material already there is rebuilt in place instead,
+	 * with the render thread caught up first and the edit bracketed the way the engine expects. */
+	if (UMaterial* Existing = FindObject<UMaterial>(GetPackage(), *GetAssetName())) {
+		FlushRenderingCommands();
+		Existing->PreEditChange(nullptr);
+
+		return IImporter::CreateAsset(Existing);
+	}
+
 	/* Create Material Factory (factory automatically creates the Material) */
 	UMaterialFactoryNew* MaterialFactory = NewObject<UMaterialFactoryNew>();
 	UMaterial* Material = Cast<UMaterial>(MaterialFactory->FactoryCreateNew(UMaterial::StaticClass(), GetPackage(), *GetAssetName(), RF_Standalone | RF_Public, nullptr, GWarn));

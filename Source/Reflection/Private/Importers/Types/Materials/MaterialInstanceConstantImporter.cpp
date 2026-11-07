@@ -1,6 +1,7 @@
 /* Copyright Reflection Contributors 2024-2026 */
 
 #include "Importers/Types/Materials/MaterialInstanceConstantImporter.h"
+#include "RenderingThread.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Dom/JsonObject.h"
 #include "RHIDefinitions.h"
@@ -8,10 +9,24 @@
 #include "Utilities/JsonHelpers.h"
 
 UObject* IMaterialInstanceConstantImporter::CreateAsset(UObject* CreatedAsset) {
+	/* Reflected again over one that is already loaded: updated in place rather than constructed in
+	 * the old one's memory, which would leave every component drawing with it holding a dead render
+	 * proxy (see IMaterialImporter::CreateAsset). OnAssetCreation's PostEditChange closes the edit. */
+	if (UMaterialInstanceConstant* Existing = FindObject<UMaterialInstanceConstant>(GetPackage(), *GetAssetName())) {
+		FlushRenderingCommands();
+		Existing->PreEditChange(nullptr);
+
+		return IImporter::CreateAsset(Existing);
+	}
+
 	return IImporter::CreateAsset(NewObject<UMaterialInstanceConstant>(GetPackage(), UMaterialInstanceConstant::StaticClass(), *GetAssetName(), RF_Public | RF_Standalone));
 }
 
 bool IMaterialInstanceConstantImporter::Import() {
+	/* An instance already in use has components drawing with it, and those have to be rebuilt
+	 * against its new static permutation; a fresh one has none */
+	const bool bUpdatingExisting = FindObject<UMaterialInstanceConstant>(GetPackage(), *GetAssetName()) != nullptr;
+
 	UMaterialInstanceConstant* MaterialInstanceConstant = Create<UMaterialInstanceConstant>();
 
 	/* Specific fix for 4.16 engines */
@@ -195,7 +210,9 @@ bool IMaterialInstanceConstantImporter::Import() {
 	}
 
 #if !MIC_STATICS_VIA_EDITOR_ONLY
-	FMaterialUpdateContext MaterialUpdateContext(FMaterialUpdateContext::EOptions::Default & ~FMaterialUpdateContext::EOptions::RecreateRenderStates);
+	FMaterialUpdateContext MaterialUpdateContext(bUpdatingExisting
+		? FMaterialUpdateContext::EOptions::Default
+		: FMaterialUpdateContext::EOptions::Default & ~FMaterialUpdateContext::EOptions::RecreateRenderStates);
 
 	MaterialInstanceConstant->UpdateStaticPermutation(NewStaticParameterSet, &MaterialUpdateContext);
 	MaterialInstanceConstant->InitStaticPermutation();

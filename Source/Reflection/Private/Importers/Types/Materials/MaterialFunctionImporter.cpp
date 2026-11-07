@@ -1,6 +1,7 @@
 /* Copyright Reflection Contributors 2024-2026 */
 
 #include "Importers/Types/Materials/MaterialFunctionImporter.h"
+#include "RenderingThread.h"
 #include "Factories/MaterialFunctionFactoryNew.h"
 
 /* 4.25 and below build this module without the engine's shared PCH (see Reflection.Build.cs),
@@ -10,6 +11,15 @@
 #endif
 
 UObject* IMaterialFunctionImporter::CreateAsset(UObject* CreatedAsset) {
+	/* Reflected again over one that is already loaded: rebuilt in place rather than constructed in
+	 * the old one's memory, which would pull it out from under every material compiled against it
+	 * (see IMaterialImporter::CreateAsset) */
+	if (UMaterialFunction* Existing = FindObject<UMaterialFunction>(GetPackage(), *GetAssetName())) {
+		FlushRenderingCommands();
+
+		return IImporter::CreateAsset(Existing);
+	}
+
 	return IImporter::CreateAsset(Cast<UMaterialFunction>(
 		NewObject<UMaterialFunctionFactoryNew>()->FactoryCreateNew(
 			UMaterialFunction::StaticClass(),
