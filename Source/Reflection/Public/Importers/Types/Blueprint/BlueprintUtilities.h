@@ -262,7 +262,9 @@ inline EBlueprintType GetBlueprintType(const UClass* Class) {
 		BlueprintType = BPTYPE_FunctionLibrary;
 	}
 	
-	if (Class == UInterface::StaticClass()) {
+	/* An animation layer interface is made on UAnimLayerInterface, which is itself an interface,
+	 * and a cook keeps no editor tag saying so; anything made on an interface is one. */
+	if (Class != nullptr && Class->IsChildOf(UInterface::StaticClass())) {
 		BlueprintType = BPTYPE_Interface;
 	}
 	

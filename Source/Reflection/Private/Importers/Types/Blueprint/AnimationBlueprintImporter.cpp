@@ -20,6 +20,9 @@
 #include "AnimGraphNode_SubInput.h"
 #else
 #include "AnimGraphNode_LinkedInputPose.h"
+#include "AnimGraphNode_LinkedAnimGraphBase.h"
+#include "AnimGraphNode_LinkedAnimLayer.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #endif
 #include "AnimGraphNode_Root.h"
 #include "AnimationGraphSchema.h"
@@ -298,6 +301,48 @@ bool IAnimationBlueprintImporter::Import() {
 	/* Newer Unreal Engine versions use CopyRecords and SerializedSparseClassData */
 	if (RootAnimNodeDefaults->HasField(TEXT("SerializedSparseClassData"))) {
 		SerializedSparseClassData = RootAnimNodeDefaults->GetObjectField(TEXT("SerializedSparseClassData"));
+	}
+
+	/* 4.26 cooks the same property access copies, kept on the class itself rather than in sparse
+	 * class data: the library is PropertyAccessLibrary (one copy batch, not an array of them) and
+	 * each node's copies are an entry of EvaluateGraphExposedInputs naming its node by field path.
+	 * Put into the shape the 5.x data comes in, so the bindings are read back the one way. */
+	if (!SerializedSparseClassData.IsValid()) {
+		const TSharedPtr<FJsonObject>* Library = nullptr;
+		const TArray<TSharedPtr<FJsonValue>>* Handlers = nullptr;
+
+		if (GetAssetData()->TryGetObjectField(TEXT("PropertyAccessLibrary"), Library) && GetAssetData()->TryGetArrayField(TEXT("EvaluateGraphExposedInputs"), Handlers)) {
+			const TSharedRef<FJsonObject> Sparse = MakeShared<FJsonObject>();
+			const TSharedRef<FJsonObject> Shaped = MakeShared<FJsonObject>(**Library);
+
+			if (const TSharedPtr<FJsonObject>* Batch = nullptr; !Shaped->HasField(TEXT("CopyBatchArray")) && Shaped->TryGetObjectField(TEXT("CopyBatches"), Batch)) {
+				Shaped->SetArrayField(TEXT("CopyBatchArray"), { MakeShared<FJsonValueObject>(*Batch) });
+			} else if (const TArray<TSharedPtr<FJsonValue>>* Batches = nullptr; !Shaped->HasField(TEXT("CopyBatchArray")) && Shaped->TryGetArrayField(TEXT("CopyBatches"), Batches)) {
+				Shaped->SetArrayField(TEXT("CopyBatchArray"), *Batches);
+			}
+
+			const TSharedRef<FJsonObject> Extension = MakeShared<FJsonObject>();
+			Extension->SetObjectField(TEXT("Library"), Shaped);
+			Sparse->SetObjectField(TEXT("AnimBlueprintExtension_PropertyAccess"), Extension);
+
+			int32 Placed = 0;
+
+			for (const TSharedPtr<FJsonValue>& One : *Handlers) {
+				const TSharedPtr<FJsonObject> Handler = One.IsValid() ? One->AsObject() : nullptr;
+				const TSharedPtr<FJsonObject>* Owner = nullptr;
+				const TArray<TSharedPtr<FJsonValue>>* Path = nullptr;
+
+				if (!Handler.IsValid() || !Handler->TryGetObjectField(TEXT("ValueHandlerNodeProperty"), Owner)) continue;
+				if (!(*Owner)->TryGetArrayField(TEXT("Path"), Path) || Path->Num() == 0) continue;
+
+				Sparse->SetObjectField(StringToJsonKey((*Path)[0]->AsString()), Handler);
+				Placed++;
+			}
+
+			SerializedSparseClassData = Sparse;
+
+			UE_LOG(LogReflection, Display, TEXT("\"%s\" keeps its bindings the 4.26 way: %d node handler(s) read off the class"), *GetAssetName(), Placed);
+		}
 	}
 
 	/* Kept here, before what the class carries is filtered down to its nodes.
@@ -758,6 +803,7 @@ bool IAnimationBlueprintImporter::Import() {
 	}
 
 	/* Now that there is every graph to look in */
+	SettleLayerPoses();
 	SettleCachedPoses();
 
 	/* And the rest of it, which is a blueprint's whatever else it is. The anim graph above is the
@@ -798,6 +844,13 @@ UAnimBlueprint* IAnimationBlueprintImporter::CreateAnimBlueprint(UClass* ParentC
 	const EBlueprintType BlueprintType = GetBlueprintTypeSaid(GetAssetData(), ParentClass);
 
 	if (UBlueprint* Made = CreateBlueprintGuarded(ParentClass, GetPackage(), FName(*GetAssetName()), BlueprintType, UAnimBlueprint::StaticClass(), UAnimBlueprintGeneratedClass::StaticClass())) {
+		/* A layer interface cooked without a skeleton is a template, the way UAnimBlueprintFactory
+		 * makes one: otherwise it is refused at compile for having no skeleton, and a layer node
+		 * that runs one of its layers finds no signature to make its pose pins from. */
+		if (UAnimBlueprint* Animation = Cast<UAnimBlueprint>(Made); Animation != nullptr && BlueprintType == BPTYPE_Interface && Animation->TargetSkeleton == nullptr) {
+			Animation->bIsTemplate = true;
+		}
+
 		/* Said of the base, which only takes what was made. An animation blueprint is made here,
 		 * where the blueprint importer's own makes one from nothing, and asking for that would put
 		 * a second blueprint over the one just created. */
@@ -812,7 +865,39 @@ void IAnimationBlueprintImporter::ReadFolded(const TSharedPtr<FJsonObject>& Node
 
 	const FUObjectJsonValueExport Data = GetAssetDataAsValue();
 
-	if (!Data.Has(TEXT("AnimNodeData")) || !Data.Has(TEXT("NodeTypeMap"))) return;
+	/* Which kind of node each key is, which a binding is checked against before it is kept */
+	const auto ReadKinds = [this, &Keys]() {
+		for (const FString& Key : Keys) {
+			FString NodeType, Rest;
+
+			Key.Split(TEXT("_"), &NodeType, &Rest, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+
+			if (NodeType.EndsWith(TEXT("AnimGraphNode")) || NodeType.IsEmpty()) NodeType = Key;
+
+			if (NodeType == TEXT("AnimGraphNode_Layer")) NodeType = TEXT("AnimGraphNode_LinkedAnimLayer");
+			if (NodeType == TEXT("AnimGraphNode_SubInstance")) NodeType = TEXT("AnimGraphNode_LinkedAnimGraph");
+
+			UClass* Class = FindClassByType(NodeType);
+
+			if (Class == nullptr) continue;
+
+			const UAnimGraphNode_Base* Says = Cast<UAnimGraphNode_Base>(Class->GetDefaultObject());
+
+			if (const FStructProperty* Inside = GetNodeStructProperty(Says); Inside != nullptr && Inside->Struct != nullptr) {
+				Kinds.Add(Key, Inside->Struct->GetName());
+			}
+		}
+	};
+
+	/* A cook from before 5.0 folds nothing: every node keeps its own values. There is nothing to
+	 * read back into them, but the kinds are still needed by the bindings, which 4.26 already
+	 * cooks as property access copies. */
+	if (!Data.Has(TEXT("AnimNodeData")) || !Data.Has(TEXT("NodeTypeMap"))) {
+		Kinds.Empty();
+		ReadKinds();
+
+		return;
+	}
 
 	/* Read again from nothing, since this says what one class is.
 	 *
@@ -2134,6 +2219,15 @@ void IAnimationBlueprintImporter::CreateAnimGraphNodes(UEdGraph* AnimGraph, cons
 			NodeType = "AnimGraphNode_LinkedInputPose";
 		}
 
+		/* 4.24 renamed the layer node (BaseEngine.ini keeps the class redirect); 4.2x cooks still name it the old way */
+		if (NodeType == "AnimGraphNode_Layer") {
+			NodeType = "AnimGraphNode_LinkedAnimLayer";
+		}
+
+		if (NodeType == "AnimGraphNode_SubInstance") {
+			NodeType = "AnimGraphNode_LinkedAnimGraph";
+		}
+
 		/* Only add json object data, transition result is handled different */
 		if (NodeType == "AnimGraphNode_TransitionResult") {
 			OutContainer.Exports.Add(
@@ -2243,6 +2337,18 @@ void IAnimationBlueprintImporter::HandleNodeDeserialization(FUObjectExportContai
 
 					NodeProperties->SetObjectField(TEXT("SyncGroup"), SyncGroup);
 				}
+			}
+		}
+
+		/* 4.26 names the group on the node already, but has no Method: 5.0 added it, and a named
+		 * group with the method left at its default is refused at compile ("set to not use named
+		 * sync groups, but a sync group is set"). Named is syncing, so it is said so. */
+		if (FString Grouped; NodeProperties->TryGetStringField(TEXT("GroupName"), Grouped) && !Grouped.IsEmpty() && Grouped != TEXT("None") && !NodeProperties->HasField(TEXT("Method"))) {
+			const FStructProperty* Inside = GetNodeStructProperty(Node);
+			const UScriptStruct* Holds = Inside != nullptr ? Inside->Struct : nullptr;
+
+			if (Holds != nullptr && Holds->FindPropertyByName(TEXT("Method")) != nullptr) {
+				NodeProperties->SetStringField(TEXT("Method"), TEXT("EAnimSyncMethod::SyncGroup"));
 			}
 		}
 
@@ -2522,6 +2628,38 @@ void IAnimationBlueprintImporter::HandleNodeDeserialization(FUObjectExportContai
 			}
 		}
 
+		/* Which layer a linked layer node runs is said in UE5 by its function reference, not by the
+		 * runtime node's Layer: the name, title and every pose pin the node makes come from it. A cook
+		 * only keeps the runtime node, so the reference is put back from Layer and Interface, the way
+		 * UAnimGraphNode_LinkedAnimLayer::SetLayerName does (not exported, so done here by hand). */
+		if (UAnimGraphNode_LinkedAnimLayer* LayerNode = Cast<UAnimGraphNode_LinkedAnimLayer>(Node); LayerNode != nullptr && !LayerNode->Node.Layer.IsNone()) {
+			const FName LayerName = LayerNode->Node.Layer;
+
+			if (const FStructProperty* Reference = FindFProperty<FStructProperty>(LayerNode->GetClass(), TEXT("FunctionReference"))) {
+				FMemberReference* FunctionReference = Reference->ContainerPtrToValuePtr<FMemberReference>(LayerNode);
+
+				if (UClass* Target = LayerNode->Node.Interface.Get()) {
+					FGuid FunctionGuid;
+					FBlueprintEditorUtils::GetFunctionGuidFromClassByFieldName(FBlueprintEditorUtils::GetMostUpToDateClass(Target), LayerName, FunctionGuid);
+					FunctionReference->SetExternalMember(LayerName, Target, FunctionGuid);
+				} else {
+					FunctionReference->SetSelfMember(LayerName);
+				}
+			}
+
+			/* And the guid of the interface graph it names, which is how the editor keeps a layer node
+			 * pointed at its layer through a rename */
+			if (!LayerNode->InterfaceGuid.IsValid() && AnimBlueprint != nullptr) {
+				for (const FBPInterfaceDescription& Implemented : AnimBlueprint->ImplementedInterfaces) {
+					for (const UEdGraph* InterfaceGraph : Implemented.Graphs) {
+						if (InterfaceGraph != nullptr && InterfaceGraph->GetFName() == LayerName) {
+							LayerNode->InterfaceGuid = InterfaceGraph->InterfaceGuid;
+						}
+					}
+				}
+			}
+		}
+
 		const UReflectionSettings* Settings = GetSettings();
 		if (Settings->AssetSettings.AnimationBlueprint.NodeIDComments) {
 			Node->NodeComment = NodeExport->GetName().ToString();
@@ -2647,7 +2785,56 @@ void IAnimationBlueprintImporter::ConnectAnimGraphNodes(FUObjectExportContainer*
                                 continue;
                             }
                             
-                            const FString IndexedPinName = FString::Printf(TEXT("%s_%d"), *Pair.Key, Index);
+                            FString IndexedPinName = FString::Printf(TEXT("%s_%d"), *Pair.Key, Index);
+
+                            /* A linked anim graph or layer names its pose pins after the poses the graph it
+                             * runs takes in, kept beside them as InputPoseNames, rather than by index:
+                             * InputPoses[i] is the pin called InputPoseNames[i]. */
+                            if (Key == TEXT("InputPoses")) {
+                                const TArray<TSharedPtr<FJsonValue>>* PoseNames = nullptr;
+
+                                if (Json->TryGetArrayField(TEXT("InputPoseNames"), PoseNames) && PoseNames->IsValidIndex(Index) && (*PoseNames)[Index].IsValid()) {
+                                    const FString PoseName = (*PoseNames)[Index]->AsString();
+
+                                    if (!PoseName.IsEmpty() && PoseName != TEXT("None")) {
+                                        IndexedPinName = PoseName;
+                                    }
+                                }
+
+                                /* A cook leaves InputPoseNames empty. The editor node still makes one pose
+                                 * pin per input the layer takes, in that same order, so the Index-th pose
+                                 * input is the one InputPoses[Index] fed. */
+                                if (Node->FindPin(IndexedPinName, EGPD_Input) == nullptr) {
+                                    int32 PoseInput = 0;
+
+                                    for (UEdGraphPin* Pin : Node->Pins) {
+                                        if (Pin == nullptr || Pin->Direction != EGPD_Input) continue;
+
+                                        const UScriptStruct* PinStruct = Cast<UScriptStruct>(Pin->PinType.PinSubCategoryObject.Get());
+                                        if (PinStruct == nullptr || !PinStruct->IsChildOf(FPoseLinkBase::StaticStruct())) continue;
+
+                                        if (PoseInput++ == Index) {
+                                            IndexedPinName = Pin->PinName.ToString();
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                /* Still nothing to feed: the layer the node runs has no graph yet (the
+                                 * main graph is laid out before the layers are), so the node has made
+                                 * no pose pins. Held back until every layer graph exists. */
+                                if (Node->FindPin(IndexedPinName, EGPD_Input) == nullptr && Node->IsA<UAnimGraphNode_LinkedAnimGraphBase>()) {
+                                    FPendingLayerPose& Pending = PendingLayerPoses.AddDefaulted_GetRef();
+                                    Pending.Node = Node;
+                                    Pending.Feeding = TargetNode;
+                                    Pending.Graph = AnimGraph;
+                                    Pending.PinName = IndexedPinName;
+                                    Pending.Index = Index;
+
+                                    continue;
+                                }
+                            }
+
                             LinkPoseInputPin(IndexedPinName, Node, TargetNode, AnimGraph);
                         }
                     }
@@ -2703,13 +2890,69 @@ void IAnimationBlueprintImporter::ProcessEvaluateGraphExposedInputs(const TShare
 	for (const auto& Value : EvaluateInputs) {
 		TSharedPtr<FJsonObject> InputObj = Value->AsObject();
 		
-		FString NodeName = InputObj->GetObjectField(TEXT("ValueHandlerNodeProperty"))->GetStringField(TEXT("ObjectName")); {
+		const TSharedPtr<FJsonObject>* Owner = nullptr;
+
+		if (!InputObj.IsValid() || !InputObj->TryGetObjectField(TEXT("ValueHandlerNodeProperty"), Owner)) continue;
+
+		/* Named as an object before 4.25 and as a field path after */
+		FString NodeName;
+
+		if (const TArray<TSharedPtr<FJsonValue>>* Path = nullptr; (*Owner)->TryGetArrayField(TEXT("Path"), Path) && Path->Num() > 0) {
+			NodeName = (*Path)[0]->AsString();
+		} else if ((*Owner)->TryGetStringField(TEXT("ObjectName"), NodeName)) {
 			NodeName.Split(":", nullptr, &NodeName);
-			NodeName = NodeName.Replace(TEXT("'"), TEXT(""));	
+			NodeName = NodeName.Replace(TEXT("'"), TEXT(""));
 		}
-		
-		AnimNodeProperties->GetObjectField(NodeName)->SetObjectField(TEXT("EvaluateGraphExposedInputs"), InputObj);
+
+		const TSharedPtr<FJsonObject>* Node = nullptr;
+
+		if (NodeName.IsEmpty() || !AnimNodeProperties->TryGetObjectField(StringToJsonKey(NodeName), Node)) continue;
+
+		(*Node)->SetObjectField(TEXT("EvaluateGraphExposedInputs"), InputObj);
 	}
+}
+
+void IAnimationBlueprintImporter::SettleLayerPoses() {
+	/* Every node waiting is laid out again once, now that the layer it runs has a graph and so a
+	 * signature to take its pose pins from */
+	TSet<UAnimGraphNode_Base*> Rebuilt;
+
+	for (const FPendingLayerPose& Pending : PendingLayerPoses) {
+		UAnimGraphNode_Base* Node = Pending.Node.Get();
+		UAnimGraphNode_Base* Feeding = Pending.Feeding.Get();
+		UEdGraph* Graph = Pending.Graph.Get();
+
+		if (Node == nullptr || Feeding == nullptr || Graph == nullptr) continue;
+
+		if (!Rebuilt.Contains(Node)) {
+			Node->ReconstructNode();
+			Rebuilt.Add(Node);
+		}
+
+		FString PinName = Pending.PinName;
+
+		if (Node->FindPin(PinName, EGPD_Input) == nullptr) {
+			int32 PoseInput = 0;
+
+			for (UEdGraphPin* Pin : Node->Pins) {
+				if (Pin == nullptr || Pin->Direction != EGPD_Input) continue;
+
+				const UScriptStruct* PinStruct = Cast<UScriptStruct>(Pin->PinType.PinSubCategoryObject.Get());
+				if (PinStruct == nullptr || !PinStruct->IsChildOf(FPoseLinkBase::StaticStruct())) continue;
+
+				if (PoseInput++ == Pending.Index) {
+					PinName = Pin->PinName.ToString();
+					break;
+				}
+			}
+		}
+
+		LinkPoseInputPin(PinName, Node, Feeding, Graph);
+	}
+
+	UE_LOG(LogReflection, Display, TEXT("%d pose(s) fed into %d linked layer node(s) once every layer had a graph"), PendingLayerPoses.Num(), Rebuilt.Num());
+
+	PendingLayerPoses.Empty();
 }
 
 void IAnimationBlueprintImporter::SettleInputPoses(UEdGraph* Layer) const {

@@ -51,7 +51,7 @@ private:
 	void HandleNodeDeserialization(FUObjectExportContainer* Container);
 
 	/* Links Animation Graph Nodes together using a container */
-	static void ConnectAnimGraphNodes(FUObjectExportContainer* Container, UEdGraph* AnimGraph);
+	void ConnectAnimGraphNodes(FUObjectExportContainer* Container, UEdGraph* AnimGraph);
 
 	/* Reads how the class folded its nodes' values away, and where it keeps them */
 	void ReadFolded(const TSharedPtr<FJsonObject>& Nodes, const TArray<FString>& Keys);
@@ -129,6 +129,20 @@ protected:
 
 	/* Each cached pose borrowed, and the name of the node said to have saved it */
 	TArray<TPair<TWeakObjectPtr<class UAnimGraphNode_UseCachedPose>, FString>> Borrowed;
+
+	/* A pose fed into a linked layer before the layer it runs had a graph to take its pins from */
+	struct FPendingLayerPose {
+		TWeakObjectPtr<UAnimGraphNode_Base> Node;
+		TWeakObjectPtr<UAnimGraphNode_Base> Feeding;
+		TWeakObjectPtr<UEdGraph> Graph;
+		FString PinName;
+		int32 Index = INDEX_NONE;
+	};
+
+	TArray<FPendingLayerPose> PendingLayerPoses;
+
+	/* Feeds the poses held back above, once every layer graph has been made */
+	void SettleLayerPoses();
 
 	static void UpdateBlendListByEnumVisibleEntries(FUObjectExport* NodeExport, FUObjectExportContainer* Container, UEdGraph* AnimGraph);
 	
