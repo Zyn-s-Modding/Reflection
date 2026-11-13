@@ -182,6 +182,39 @@ bool IBlueprintImporter::Import() {
 
 	GetObjectSerializer()->DeserializeObjectProperties(ClassDefaultObjectExport->GetProperties(), GeneratedClass->GetDefaultObject());
 
+	/* A gameplay ability asked to replicate that is not kept one per actor.
+	 *
+	 * An older engine took the two settings as they came: only an ability kept per actor is replicated,
+	 * and asking for it on any other kind did nothing. This one checks the pair when the blueprint is
+	 * compiled and refuses it, so a game that shipped with the setting left on has abilities that will
+	 * not compile here. Turned off, the ability does exactly what it did before, and it compiles.
+	 *
+	 * Asked for by name, since this has no business knowing the abilities module is there. */
+	if (UObject* Defaults = GeneratedClass->GetDefaultObject()) {
+		bool bAbility = false;
+
+		for (const UClass* Above = GeneratedClass; Above != nullptr && !bAbility; Above = Above->GetSuperClass()) {
+			bAbility = Above->GetFName() == TEXT("GameplayAbility") && Above->GetOutermost()->GetFName() == TEXT("/Script/GameplayAbilities");
+		}
+
+		const FByteProperty* Replicates = bAbility ? FindFProperty<FByteProperty>(GeneratedClass, TEXT("ReplicationPolicy")) : nullptr;
+		const FByteProperty* Instanced = bAbility ? FindFProperty<FByteProperty>(GeneratedClass, TEXT("InstancingPolicy")) : nullptr;
+
+		if (Replicates != nullptr && Instanced != nullptr && Replicates->Enum != nullptr && Instanced->Enum != nullptr) {
+			const int64 No = Replicates->Enum->GetValueByNameString(TEXT("ReplicateNo"));
+			const int64 PerActor = Instanced->Enum->GetValueByNameString(TEXT("InstancedPerActor"));
+
+			uint8* Replicating = Replicates->ContainerPtrToValuePtr<uint8>(Defaults);
+			const uint8* Kept = Instanced->ContainerPtrToValuePtr<uint8>(Defaults);
+
+			if (No != INDEX_NONE && PerActor != INDEX_NONE && *Replicating != static_cast<uint8>(No) && *Kept != static_cast<uint8>(PerActor)) {
+				*Replicating = static_cast<uint8>(No);
+
+				UE_LOG(LogReflection, Display, TEXT("\"%s\" asked to replicate without being kept per actor, which only ever did nothing, and no longer asks"), *Blueprint->GetName());
+			}
+		}
+	}
+
 	/* A subobject the parent made and the blueprint changed, outered to the defaults and named by nothing in them */
 	{
 		UObject* Defaults = GeneratedClass->GetDefaultObject();
@@ -767,6 +800,36 @@ void IBlueprintImporter::ConstructScript() const {
 
 		UE_LOG(LogReflection, Display, TEXT("\"%s\" had no template of its own, so \"%s\" was made where the class keeps it"),
 			*Node->GetVariableName().ToString(), *Wanted);
+	}
+
+	/* A component only the editor had.
+	 *
+	 * A component marked editor only is not in a cooked game: the cook threw its template away and
+	 * left the node, the variable and every line of script that reads the variable. A node with no
+	 * template makes no variable when the blueprint is compiled, so what reads it reads nothing and
+	 * a call made on it is a call on nobody. It is given back as the plain component its node says
+	 * it is, marked the way it must have been for the cook to drop it. What it was set to is gone. */
+	for (USCS_Node* Node : SimpleConstructionScript->GetAllNodes()) {
+		if (Node == nullptr || Node->ComponentTemplate != nullptr) continue;
+		if (Node->ComponentClass == nullptr || !Node->ComponentClass->IsChildOf(UActorComponent::StaticClass())) continue;
+		if (Node->GetVariableName().IsNone()) continue;
+
+		const FString Wanted = Node->GetVariableName().ToString() + TEXT("_GEN_VARIABLE");
+
+		if (UObject* Holding = StaticFindObject(nullptr, GeneratedClass, *Wanted)) {
+			MoveToTransientPackageAndRename(Holding);
+		}
+
+		UActorComponent* Template = NewObject<UActorComponent>(GeneratedClass, Node->ComponentClass, *Wanted, RF_ArchetypeObject | RF_Public | RF_Transactional);
+
+		if (Template == nullptr) continue;
+
+		Template->bIsEditorOnly = true;
+
+		Node->ComponentTemplate = Template;
+
+		UE_LOG(LogReflection, Display, TEXT("\"%s\" is a component the cook threw its template away for, so it was made again as a plain editor-only %s"),
+			*Node->GetVariableName().ToString(), *Node->ComponentClass->GetName());
 	}
 
 	/* A node the cook left without a name. */

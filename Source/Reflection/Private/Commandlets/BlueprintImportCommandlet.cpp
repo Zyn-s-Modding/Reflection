@@ -17,6 +17,7 @@
 #endif
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
+#include "K2Node_CreateDelegate.h"
 #include "Engine/Blueprint.h"
 #include "Importers/Types/Blueprint/MacroPattern.h"
 #include "Importers/Constructor/Asset.h"
@@ -38,6 +39,122 @@
 #endif
 
 DECLARE_LOG_CATEGORY_CLASS(LogBlueprintImport, All, All);
+
+/* One asset of a list: fetched, imported and saved, and reported as one line either way.
+ *
+ * The same three steps a single -path takes. What a single run does after them (the dumps, the
+ * disassembly) belongs to looking at one asset and is not offered for a list. */
+static bool ImportListed(const FString& Path, int32& OutSaved) {
+	const TSharedPtr<FJsonObject> Response = Cloud::Export::GetRawBlocking(Path);
+
+	if (!Response.IsValid() || !Response->HasField(TEXT("exports"))) {
+		UE_LOG(LogBlueprintImport, Error, TEXT("the cloud had nothing at \"%s\""), *Path);
+
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>> Exports = Response->GetArrayField(TEXT("exports"));
+
+	IImporter* Importer = nullptr;
+
+	const bool bImported = IImportReader::ReadExportsAndImport(Exports, Path, Importer, true, false);
+
+	if (!bImported || Importer == nullptr) {
+		UE_LOG(LogBlueprintImport, Error, TEXT("nothing was made from \"%s\""), *Path);
+
+		return false;
+	}
+
+	TArray<UPackage*> Dirty;
+	FEditorFileUtils::GetDirtyContentPackages(Dirty);
+	FEditorFileUtils::GetDirtyWorldPackages(Dirty);
+
+	const UPackage* Imported = Importer->GetPackage();
+
+	for (UPackage* Package : Dirty) {
+		const FString FileName = FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension());
+
+		/* Loading dirties packages nobody asked to change, so only what this import made is written */
+		if (Package != Imported && FPaths::FileExists(FileName)) {
+			continue;
+		}
+
+#if ENGINE_UE5
+		Package->ClearPackageFlags(PKG_ContainsNoAsset);
+
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+
+		if (UPackage::SavePackage(Package, nullptr, *FileName, SaveArgs)) {
+#else
+		if (UPackage::SavePackage(Package, nullptr, RF_Public | RF_Standalone, *FileName)) {
+#endif
+			OutSaved++;
+		} else {
+			UE_LOG(LogBlueprintImport, Warning, TEXT("could not save %s"), *FileName);
+		}
+	}
+
+	return true;
+}
+
+/* Every path in a file, one to a line, in the one run.
+ *
+ * Starting the editor costs more than most imports do, so a project's worth of blueprints is
+ * done in a single session. Each path is written to the progress file before it is started and
+ * again once it is over, so a run that dies on one asset can be picked up after it. */
+static int32 ImportList(const FString& ListFile, const FString& ProgressFile) {
+	TArray<FString> Paths;
+
+	if (!FFileHelper::LoadFileToStringArray(Paths, *ListFile)) {
+		UE_LOG(LogBlueprintImport, Error, TEXT("could not read the list at \"%s\""), *ListFile);
+
+		return 1;
+	}
+
+	Cloud::EnsureMetadataBlocking();
+
+	int32 Done = 0;
+	int32 Failed = 0;
+	int32 Saved = 0;
+
+	const auto Note = [&ProgressFile](const FString& Line) {
+		if (!ProgressFile.IsEmpty()) {
+			FFileHelper::SaveStringToFile(Line + LINE_TERMINATOR, *ProgressFile, FFileHelper::EEncodingOptions::AutoDetect, &IFileManager::Get(), FILEWRITE_Append);
+		}
+	};
+
+	for (FString Path : Paths) {
+		Path.TrimStartAndEndInline();
+
+		if (Path.IsEmpty()) {
+			continue;
+		}
+
+		Note(TEXT("BEGIN ") + Path);
+
+		UE_LOG(LogBlueprintImport, Display, TEXT("[%d/%d] importing \"%s\""), Done + Failed + 1, Paths.Num(), *Path);
+
+		if (ImportListed(Path, Saved)) {
+			Done++;
+
+			Note(TEXT("OK ") + Path);
+		} else {
+			Failed++;
+
+			Note(TEXT("FAIL ") + Path);
+		}
+
+		/* What an import loads stays loaded, and a project's worth of them does not fit */
+		if ((Done + Failed) % 25 == 0) {
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+		}
+	}
+
+	UE_LOG(LogBlueprintImport, Display, TEXT("list done: %d imported, %d failed, %d package(s) saved"), Done, Failed, Saved);
+
+	return 0;
+}
 
 int32 UBlueprintImportCommandlet::Main(const FString& Params) {
 	UE_LOG(LogBlueprintImport, Display, TEXT("asked for: %s"), *Params);
@@ -89,6 +206,23 @@ int32 UBlueprintImportCommandlet::Main(const FString& Params) {
 		}
 
 		return 0;
+	}
+
+	/* A file of cloud paths rather than the one: -list=<file> [-progress=<file>], with -norefs and
+	 * -nocode meaning what they mean for a single path. */
+	if (FString ListFile; FParse::Value(*Params, TEXT("list="), ListFile) && !ListFile.IsEmpty()) {
+		if (FParse::Param(*Params, TEXT("norefs"))) {
+			FAssetUtilities::bImportReferences = false;
+		}
+
+		if (FParse::Param(*Params, TEXT("nocode"))) {
+			GetSettings()->AssetSettings.ImportBlueprintCode = false;
+		}
+
+		FString ProgressFile;
+		FParse::Value(*Params, TEXT("progress="), ProgressFile);
+
+		return ImportList(ListFile, ProgressFile);
 	}
 
 	FString Path;
@@ -375,8 +509,24 @@ int32 UBlueprintImportCommandlet::Main(const FString& Params) {
 
 					Written += FString::Printf(TEXT("  %s [%s]") LINE_TERMINATOR, *Node->GetName(), *Node->GetNodeTitle(ENodeTitleType::ListView).ToString().Replace(TEXT("\n"), TEXT(" ")).Replace(TEXT("\r"), TEXT("")));
 
+					/* What a Create Event stands for, which none of its pins say */
+					if (const UK2Node_CreateDelegate* Maker = Cast<UK2Node_CreateDelegate>(Node)) {
+						const UFunction* Signature = Maker->GetDelegateSignature();
+
+						Written += FString::Printf(TEXT("      :: binds \"%s\" as %s") LINE_TERMINATOR,
+							*Maker->GetFunctionName().ToString(), Signature != nullptr ? *Signature->GetPathName() : TEXT("(no signature)"));
+					}
+
+					/* And what the compiler said of it, which the log gives without saying which node it meant */
+					if (Node->bHasCompilerMessage && !Node->ErrorMsg.IsEmpty()) {
+						Written += FString::Printf(TEXT("      !! %s: %s") LINE_TERMINATOR,
+							Node->ErrorType <= EMessageSeverity::Error ? TEXT("error") : TEXT("warning"),
+							*Node->ErrorMsg.Replace(TEXT("\n"), TEXT(" | ")).Replace(TEXT("\r"), TEXT("")));
+					}
+
 					for (const UEdGraphPin* Pin : Node->Pins) {
-						if (Pin == nullptr || Pin->bHidden) continue;
+						/* A hidden pin is only worth a line on a node the compiler complained about */
+						if (Pin == nullptr || (Pin->bHidden && !Node->bHasCompilerMessage)) continue;
 
 						FString Leads;
 
@@ -387,7 +537,8 @@ int32 UBlueprintImportCommandlet::Main(const FString& Params) {
 						Written += FString::Printf(TEXT("      %s %s (%s)%s -> %s") LINE_TERMINATOR,
 							Pin->Direction == EGPD_Input ? TEXT("in ") : TEXT("out"),
 							*Pin->PinName.ToString(),
-							*Pin->PinType.PinCategory.ToString(),
+							/* With the width a real is carried at, since float and double are the same category */
+							Pin->PinType.PinSubCategory.IsNone() ? *Pin->PinType.PinCategory.ToString() : *(Pin->PinType.PinCategory.ToString() + TEXT("/") + Pin->PinType.PinSubCategory.ToString()),
 							Pin->DefaultValue.IsEmpty() && Pin->DefaultObject == nullptr ? TEXT("") : *FString::Printf(TEXT(" = %s"), Pin->DefaultObject != nullptr ? *Pin->DefaultObject->GetName() : *Pin->DefaultValue),
 							Leads.IsEmpty() ? TEXT("-") : *Leads);
 					}

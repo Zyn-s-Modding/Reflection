@@ -86,6 +86,32 @@ namespace {
 DECLARE_LOG_CATEGORY_CLASS(LogReflectionBytecode, All, All);
 
 namespace {
+	/* A member of a struct under the name this build knows it by.
+	 *
+	 * A struct the engine declares can rename a member between the build a game was cooked on and
+	 * this one, keeping the old name only as something it reads old data out of. The script still
+	 * says the old name, and a node made for the struct has no pin of that name to put it on. */
+	FString MemberAsThisBuildNamesIt(const UScriptStruct* Struct, const FString& Member) {
+		if (Struct == nullptr || Member.IsEmpty()) return Member;
+
+		if (FindFProperty<FProperty>(Struct, *Member) != nullptr) return Member;
+
+		static const TMap<FString, FString> Renamed = {
+			/* FSoundAttenuationSettings: the radius inside which a sound is not spatialised (4.26 -> 5.0) */
+			{ TEXT("SoundAttenuationSettings.OmniRadius"), TEXT("NonSpatializedRadiusStart") },
+		};
+
+		for (const UStruct* Asked = Struct; Asked != nullptr; Asked = Asked->GetSuperStruct()) {
+			if (const FString* Now = Renamed.Find(Asked->GetName() + TEXT(".") + Member)) {
+				if (FindFProperty<FProperty>(Struct, **Now) != nullptr) return *Now;
+			}
+		}
+
+		return Member;
+	}
+}
+
+namespace {
 	/* An object reference, as the two halves the bytecode spells it in: a name that carries the
 	 * class and the member, and a path that carries the package they live in */
 	void SplitReference(const FUObjectJsonValueExport& Reference, FString& OutOwner, FString& OutMember) {
@@ -2613,7 +2639,7 @@ FBytecodeGraph::FValue FBytecodeGraph::ReadExpression(const FUObjectJsonValueExp
 				Connect(Held.Pin, Node->FindPinChecked(Struct->GetFName(), EGPD_Input));
 			}
 
-			Value.Pin = Node->FindPin(*Member, EGPD_Output);
+			Value.Pin = Node->FindPin(*MemberAsThisBuildNamesIt(Struct, Member), EGPD_Output);
 
 			if (Value.Pin != nullptr) {
 				if (bMade && !SameBreak.IsEmpty()) {
@@ -2638,7 +2664,9 @@ FBytecodeGraph::FValue FBytecodeGraph::ReadExpression(const FUObjectJsonValueExp
 		 * Splitting the pin reaches the same field without a node: the members are read straight off
 		 * whatever hands the struct over, which is what the editor does with a struct it will not
 		 * break. */
-		if (Held.Pin != nullptr && !Member.IsEmpty()) {
+		/* Unless something already reads the struct whole. Splitting a pin cuts every wire on it, so
+		 * the nodes that took it apart before this member came up would be left reading nothing. */
+		if (Held.Pin != nullptr && !Member.IsEmpty() && (Held.Pin->SubPins.Num() > 0 || Held.Pin->LinkedTo.Num() == 0)) {
 			if (Held.Pin->SubPins.Num() == 0) {
 				GetDefault<UEdGraphSchema_K2>()->SplitPin(Held.Pin, false);
 			}
@@ -3649,6 +3677,8 @@ bool FBytecodeGraph::FillStruct(const FUObjectJsonValueExport& Statement, const 
 	}
 
 	if (Named.IsEmpty()) return false;
+
+	Named = MemberAsThisBuildNamesIt(Kind, Named);
 
 	/* The local it is being built in, which is what the node hands out from here on */
 	const FString Into = MacroReading::NamedProperty(Variable.GetObject(TEXT("StructExpression")).GetObject(TEXT("Variable")));
@@ -6133,6 +6163,38 @@ int32 FBytecodeGraph::Build() {
 
 		if (UEdGraphPin** Held = Locals.Find(One.Value); Held != nullptr && *Held != nullptr) {
 			Connect(*Held, One.Key);
+
+			continue;
+		}
+
+		/* A struct made with nothing set on it.
+		 *
+		 * A Make node writes a statement for each member somebody gave a value, and a member left
+		 * as the struct declares it writes none. With every member left alone the node compiles to
+		 * nothing at all: the local it was made for is still there and still handed to whoever read
+		 * the node, but nothing in the script ever says where it came from. The name is the only
+		 * thing that does, and it is the name the compiler gives a Make node's result. Without the
+		 * node the pin reads as never wired, which a parameter taken by reference does not allow. */
+		if (!One.Value.StartsWith(TEXT("K2Node_MakeStruct_"))) continue;
+		if (One.Key->PinType.PinCategory != UEdGraphSchema_K2::PC_Struct || One.Key->PinType.IsContainer()) continue;
+
+		UScriptStruct* Kind = Cast<UScriptStruct>(One.Key->PinType.PinSubCategoryObject.Get());
+
+		if (Kind == nullptr || !UK2Node_MakeStruct::CanBeMade(Kind)) continue;
+
+		UK2Node_MakeStruct* Node = AddNode<UK2Node_MakeStruct>();
+
+		Node->StructType = Kind;
+		Node->bMadeAfterOverridePinRemoval = true;
+
+		Node->AllocateDefaultPins();
+
+		if (UEdGraphPin* Out = Node->FindPin(Kind->GetFName(), EGPD_Output)) {
+			Locals.Add(One.Value, Out);
+
+			Connect(Out, One.Key);
+
+			UE_LOG(LogReflectionBytecode, Display, TEXT("\"%s\" was made with nothing set on it, and is drawn as a Make %s"), *One.Value, *Kind->GetName());
 		}
 	}
 
