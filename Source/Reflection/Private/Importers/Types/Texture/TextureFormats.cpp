@@ -2,10 +2,12 @@
 
 #include "Importers/Types/Texture/TextureFormats.h"
 
+#if PLATFORM_WINDOWS
 #include "detex.h"
 #include "nvimage/DirectDrawSurface.h"
 #include "nvimage/Image.h"
 #include "ThirdParty/NVTT/ThirdParty/NVTTStream.h"
+#endif
 
 int64 FTextureSourceLayout::GetEncodedSliceSize(const int32 SizeX, const int32 SizeY) const {
 	const int64 BlocksX = (SizeX + BlockDim - 1) / BlockDim;

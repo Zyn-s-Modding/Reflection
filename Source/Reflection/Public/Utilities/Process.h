@@ -8,12 +8,7 @@
  * in raw it collides with whatever includes WindowsPlatformProcess.h afterwards, and which file
  * that is depends on how the unity blob was put together. */
 
- 
-/* [linux]  I would hope it's obvious that we don't have access to
- *          Windows libraries/code on a Linux environment. If anyone
- *          in the future cares enough, a proper guard for other
- *          platforms should probably be added here. (ie #if PLATFORM_WINDOWS) */
-#if  !PLATFORM_LINUX
+#if PLATFORM_WINDOWS
 #include "Windows/WindowsHWrapper.h"
 #include "Windows/AllowWindowsPlatformTypes.h"
 #include <TlHelp32.h>
@@ -23,11 +18,7 @@
 inline void CloseApplicationByProcessName(const FString& ProcessName) {
 
 
-/* [linux]  I would hope it's obvious that we don't have access to
- *          Windows libraries/code on a Linux environment. If anyone
- *          in the future cares enough, a proper guard for other
- *          platforms should probably be added here. (ie #if PLATFORM_WINDOWS) */
-#if  !PLATFORM_LINUX
+#if PLATFORM_WINDOWS
 	DWORD ProcessID = 0;
 
 	const HANDLE Snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -64,11 +55,7 @@ inline void CloseApplicationByProcessName(const FString& ProcessName) {
 inline bool IsProcessRunning(const FString& ProcessName) {
 
 
-/* [linux]  I would hope it's obvious that we don't have access to
- *          Windows libraries/code on a Linux environment. If anyone
- *          in the future cares enough, a proper guard for other
- *          platforms should probably be added here. (ie #if PLATFORM_WINDOWS) */
-#if  !PLATFORM_LINUX
+#if PLATFORM_WINDOWS
 	bool IsRunning = false;
 
 	/* Convert FString to WCHAR */
@@ -92,6 +79,8 @@ inline bool IsProcessRunning(const FString& ProcessName) {
 	}
 
 	return IsRunning;
+#elif PLATFORM_MAC
+	return FPlatformProcess::IsApplicationRunning(*ProcessName);
 #else
 	/* @LINUX.PROCESSES */
 	return true;

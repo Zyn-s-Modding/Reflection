@@ -48,10 +48,7 @@ bool FTextureCreator::Create(const FString& Type, const TSharedPtr<FJsonObject>&
 
 bool FTextureCreator::IsRawMipData() const {
 
-/* [linux]	Raw mip data importing currently isn't working properly on linux.
- *			Let's not even try to import this way, for now. */
-
-#if PLATFORM_LINUX
+#if !PLATFORM_WINDOWS
 	return false;
 #else
 	return UseRawMipData;

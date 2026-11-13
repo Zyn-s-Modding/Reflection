@@ -27,6 +27,9 @@
 			"Name": "Detex",
 			"Type": "Editor",
 			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64"
+			],
 			"PlatformDenyList": [
 				"Android"
 			]
@@ -35,12 +38,19 @@
 			"Name": "NVTT",
 			"Type": "Editor",
 			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64"
+			],
 			"PlatformDenyList": [
 				"Android"
 			]
 		}
 	],
 	"Plugins": [
+		{
+			"Name": "GameplayTagsEditor",
+			"Enabled": true
+		},
 		{
 			"Name": "Niagara",
 			"Enabled": true
