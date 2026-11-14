@@ -558,6 +558,160 @@ static void SettleEnumExecs(UBlueprint* Blueprint) {
 	}
 }
 
+/* The parts of a gameplay effect, named so a child finds its parent's.
+ *
+ * This engine keeps what an effect does in components, and makes them from the older settings the
+ * first time the effect is compiled. A child's are matched to its parent's by name, and a component
+ * made that way is named by whatever number came up. Bring the parent in again and its component has
+ * a new name, the child still holds the old one, and loading the child copies the parent's in beside
+ * it: two of the same kind, which the effect refuses. Named for the kind of component alone, the name
+ * is the same every time either of them is brought in.
+ *
+ * One the parent already has keeps the parent's name, since that name is the match.
+ *
+ * Asked for by name, since this has no business knowing the abilities module is there. */
+static void SettleEffectComponents(const UBlueprint* Blueprint) {
+	UClass* Class = Blueprint != nullptr ? Blueprint->GeneratedClass.Get() : nullptr;
+
+	if (Class == nullptr) return;
+
+	bool bEffect = false;
+
+	for (const UClass* Above = Class; Above != nullptr && !bEffect; Above = Above->GetSuperClass()) {
+		bEffect = Above->GetFName() == TEXT("GameplayEffect") && Above->GetOutermost()->GetFName() == TEXT("/Script/GameplayAbilities");
+	}
+
+	UObject* Defaults = bEffect ? Class->GetDefaultObject(false) : nullptr;
+	const FArrayProperty* Parts = bEffect ? FindFProperty<FArrayProperty>(Class, TEXT("GEComponents")) : nullptr;
+	const FObjectPropertyBase* Part = Parts != nullptr ? CastField<FObjectPropertyBase>(Parts->Inner) : nullptr;
+
+	if (Defaults == nullptr || Part == nullptr) return;
+
+	UObject* Parent = Defaults->GetArchetype();
+
+	/* What the parent keeps, by kind: the name each of those goes by is the name the child's has to */
+	TMap<const UClass*, FName> Above;
+
+	if (Parent != nullptr && Parent->GetClass()->IsChildOf(Parts->GetOwnerClass())) {
+		FScriptArrayHelper Theirs(Parts, Parts->ContainerPtrToValuePtr<void>(Parent));
+
+		for (int32 Index = 0; Index < Theirs.Num(); Index++) {
+			if (const UObject* Component = Part->GetObjectPropertyValue(Theirs.GetRawPtr(Index))) {
+				if (!Above.Contains(Component->GetClass())) Above.Add(Component->GetClass(), Component->GetFName());
+			}
+		}
+	}
+
+	FScriptArrayHelper Held(Parts, Parts->ContainerPtrToValuePtr<void>(Defaults));
+
+	const ERenameFlags Quietly = REN_DontCreateRedirectors | REN_NonTransactional | REN_ForceNoResetLoaders;
+
+	/* One of a kind.
+	 *
+	 * A child that was already loaded when its parent was brought in again is left holding the
+	 * component the parent had before, and compiling it copies the parent's new one in beside that.
+	 * The one that is not the parent's copy is the one carrying what the child itself was set to, so
+	 * that is the one kept, and it takes the parent's name below. */
+	TMap<const UClass*, TArray<int32>> Kinds;
+
+	for (int32 Index = 0; Index < Held.Num(); Index++) {
+		if (const UObject* Component = Part->GetObjectPropertyValue(Held.GetRawPtr(Index))) {
+			Kinds.FindOrAdd(Component->GetClass()).Add(Index);
+		}
+	}
+
+	TArray<int32> Dropped;
+
+	for (const TPair<const UClass*, TArray<int32>>& Kind : Kinds) {
+		if (Kind.Value.Num() < 2) continue;
+
+		const FName* Theirs = Above.Find(Kind.Key);
+
+		int32 Kept = Kind.Value[0];
+
+		for (const int32 Index : Kind.Value) {
+			const UObject* Component = Part->GetObjectPropertyValue(Held.GetRawPtr(Index));
+
+			if (Theirs == nullptr || Component->GetFName() != *Theirs) {
+				Kept = Index;
+
+				break;
+			}
+		}
+
+		for (const int32 Index : Kind.Value) {
+			if (Index != Kept) Dropped.Add(Index);
+		}
+	}
+
+	Dropped.Sort([](const int32 A, const int32 B) { return A > B; });
+
+	for (const int32 Index : Dropped) {
+		UObject* Component = Part->GetObjectPropertyValue(Held.GetRawPtr(Index));
+
+		Held.RemoveValues(Index, 1);
+
+		if (Component != nullptr && Component->GetOuter() == Defaults) {
+			Component->Rename(nullptr, GetTransientPackage(), Quietly);
+		}
+	}
+
+	if (Dropped.Num() > 0) {
+		UE_LOG(LogReflection, Display, TEXT("\"%s\" held %d component(s) of a kind it already had, and holds one of each again"), *Blueprint->GetName(), Dropped.Num());
+	}
+
+	for (int32 Index = 0; Index < Held.Num(); Index++) {
+		UObject* Component = Part->GetObjectPropertyValue(Held.GetRawPtr(Index));
+
+		if (Component == nullptr || Component->GetOuter() != Defaults) continue;
+
+		/* The parent's name for it where the parent has one, and the kind of component where not */
+		const FName* Theirs = Above.Find(Component->GetClass());
+		const FName Wanted = Theirs != nullptr ? *Theirs : Component->GetClass()->GetFName();
+
+		if (Component->GetFName() == Wanted) continue;
+
+		/* Whatever was left behind under that name is nothing the effect holds any more */
+		if (UObject* Stale = StaticFindObjectFast(nullptr, Defaults, Wanted)) {
+			Stale->Rename(nullptr, GetTransientPackage(), Quietly);
+		}
+
+		Component->Rename(*Wanted.ToString(), Defaults, Quietly);
+
+		UE_LOG(LogReflection, Display, TEXT("\"%s\" keeps its %s under the name \"%s\""), *Blueprint->GetName(), *Component->GetClass()->GetName(), *Wanted.ToString());
+	}
+
+	/* And said to be as new as it is.
+	 *
+	 * An effect remembers which shape its settings were last saved in, and the engine only marks one
+	 * as brought up to date once it has been loaded from disk. One made here has never been loaded, so
+	 * it is saved still saying it is the old shape, and every load after that makes its components out
+	 * of the old settings all over again, beside the ones it already has. */
+	if (const FStructProperty* Version = FindFProperty<FStructProperty>(Class, TEXT("DataVersion"))) {
+		if (FProperty* Current = Version->Struct != nullptr ? Version->Struct->FindPropertyByName(TEXT("CurrentVersion")) : nullptr) {
+			void* At = Current->ContainerPtrToValuePtr<void>(Version->ContainerPtrToValuePtr<void>(Defaults));
+
+			const FEnumProperty* AsEnum = CastField<FEnumProperty>(Current);
+			const UEnum* Versions = AsEnum != nullptr ? AsEnum->GetEnum() : nullptr;
+
+			if (Versions != nullptr && AsEnum->GetUnderlyingProperty() != nullptr) {
+				/* The newest the engine knows, which is the last entry before the one that only counts them */
+				int64 Newest = 0;
+
+				for (int32 Index = 0; Index < Versions->NumEnums(); Index++) {
+					if (Versions->ContainsExistingMax() && Index == Versions->NumEnums() - 1) break;
+
+					Newest = FMath::Max(Newest, Versions->GetValueByIndex(Index));
+				}
+
+				if (AsEnum->GetUnderlyingProperty()->GetSignedIntPropertyValue(At) < Newest) {
+					AsEnum->GetUnderlyingProperty()->SetIntPropertyValue(At, Newest);
+				}
+			}
+		}
+	}
+}
+
 bool CompileBlueprintGuarded(UBlueprint* Blueprint, const EBlueprintCompileOptions Options) {
 	if (Blueprint == nullptr) return false;
 
@@ -584,6 +738,8 @@ bool CompileBlueprintGuarded(UBlueprint* Blueprint, const EBlueprintCompileOptio
 	const int32 Depth = SlowTasks();
 
 	if (Attempt(Blueprint, Options)) {
+		SettleEffectComponents(Blueprint);
+
 		return true;
 	}
 
