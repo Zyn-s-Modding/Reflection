@@ -862,12 +862,8 @@ void UObjectSerializer::DeserializeObjectProperties(const TSharedPtr<FJsonObject
 		}
 #endif
 
-		if (Properties->HasField(PropertyName) && !HasHandledProperty && PropertyName != "LODParentPrimitive" && PropertyName != "bIsCookedForEditor") {
-			const TSharedPtr<FJsonValue>& ValueObject = Properties->Values.FindChecked(StringToJsonKey(PropertyName));
-
-			if (Property->ArrayDim == 1 || ValueObject->Type == EJson::Array) {
-				PropertySerializer->DeserializePropertyValue(Property, ValueObject.ToSharedRef(), PropertyValue, Object);
-			}
+		if (!HasHandledProperty && PropertyName != "LODParentPrimitive" && PropertyName != "bIsCookedForEditor") {
+			PropertySerializer->DeserializePropertyField(Property, *Properties, PropertyName, Object, Object);
 		}
 	}
 	

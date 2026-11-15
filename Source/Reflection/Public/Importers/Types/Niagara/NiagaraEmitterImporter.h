@@ -17,6 +17,8 @@ class INiagaraEmitterImporter final : public IObjectImporter {
 public:
 	virtual void Repair(UObject* Asset) const override;
 
+	static void RestoreVersions(UObject* Asset, FUObjectExportContainer* Container);
+
 	virtual void Validate(UObject* Asset) const override;
 };
 

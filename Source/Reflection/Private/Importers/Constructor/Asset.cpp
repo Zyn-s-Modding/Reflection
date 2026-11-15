@@ -310,7 +310,8 @@ bool FAssetUtilities::ConstructAsset(const FString& Path, const FString& RealPat
 	/* Every path out of here is a request. With no Cloud to answer them, each reference would sit
 	 * on a connection that is never going to be made, behind a scope announcing it, and end up
 	 * exactly where it started. */
-	if (!Cloud::Status::IsOpened()) {
+	const bool bConnectedCommandlet = IsRunningCommandlet() && !GReflectionRuntime.Profile.ProjectName.IsEmpty();
+	if (!bConnectedCommandlet && !Cloud::Status::IsOpened()) {
 		return false;
 	}
 
@@ -344,31 +345,17 @@ bool FAssetUtilities::ConstructAsset(const FString& Path, const FString& RealPat
 			return true;
 		}
 
-		const TSharedPtr<FJsonObject> JsonObject = Response->GetArrayField(TEXT("exports"))[0]->AsObject();
+		const TArray<TSharedPtr<FJsonValue>>* Exports = nullptr;
+		if (!Response->TryGetArrayField(TEXT("exports"), Exports) || Exports->Num() == 0) return false;
+
 		FString PackagePath;
 		FString AssetName;
-		RealPath.Split(".", &PackagePath, &AssetName);
+		if (!RealPath.Split(TEXT("."), &PackagePath, &AssetName)) return false;
 
-		if (JsonObject) {
-			const FString NewPath = PackagePath;
-
-			FString RootName; {
-				NewPath.Split("/", nullptr, &RootName, ESearchCase::IgnoreCase, ESearchDir::FromStart);
-				RootName.Split("/", &RootName, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromStart);
-			}
-
-			if (RootName != "Game" && RootName != "Engine" && GetPlugin(RootName) == nullptr) {
-				CreatePlugin(RootName);
-			}
-
-			IImporter* OutImporter;
-			bSuccess = IImportReader::ReadExportsAndImport(Response->GetArrayField(TEXT("exports")), PackagePath, OutImporter, true);
-
-			/* Define found object */
-			OutObject = FindByReference<T>(RealPath);
-
-			return OutObject != nullptr;
-		}
+		IImporter* OutImporter = nullptr;
+		bSuccess = IImportReader::ReadExportsAndImport(*Exports, PackagePath + TEXT(".uasset"), OutImporter, true, false);
+		OutObject = FindByReference<T>(RealPath);
+		return OutObject != nullptr;
 	}
 
 	return false;

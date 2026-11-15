@@ -8,6 +8,12 @@
 #include "Engine/EngineUtilities.h"
 
 #include "EdGraph/EdGraphNode.h"
+#include "NiagaraGraph.h"
+#include "NiagaraScriptSource.h"
+
+bool INiagaraScriptImporter::Import() {
+	return FNiagaraGraphs::HasSerializedPins(GetContainer()) && IObjectImporter::Import();
+}
 
 void INiagaraScriptImporter::Repair(UObject* Asset) const {
 	FUObjectExportContainer* Container = GetContainer();
@@ -28,54 +34,68 @@ void INiagaraScriptImporter::Repair(UObject* Asset) const {
 		);
 	}
 
-	/* The source the script is written in.
-	 *
-	 * A script keeps a version of itself per revision, each naming the source its graph hangs off,
-	 * and says which of them it exposes. That is what the version list is for, so it is read
-	 * rather than guessed at, and the one it names is the one used.
-	 *
-	 * Where the list did not come across there is still the source itself sitting under the script.
-	 * The last is taken, since versions are added in order and the newest is the one an asset is
-	 * left at, and the guess is reported rather than made quietly. */
-	const int32 Restored = FNiagaraCookedCache::Restore(Container);
+	FNiagaraCookedCache::Restore(Container);
 
-	const FNiagaraVersion Version = FNiagaraVersions::Only(Asset);
-
-	const bool bNamed = FNiagaraVersions::HasObject(Version, TEXT("Source"));
-
-	int32 Sources = 0;
-
-	if (!bNamed) {
-		UObject* Source = nullptr;
-
-		for (FUObjectExport* Export : Container->Exports) {
-			if (Export->Object == nullptr || Export->GetType() != FName(TEXT("NiagaraScriptSource"))) continue;
-
-			Source = Export->Object;
-
-			Sources++;
-		}
-
-		if (Source != nullptr) {
-			FNiagaraVersions::SetObject(Version, TEXT("Source"), Source);
-		}
-
-		if (Sources > 1) {
-			FImportIssues::Report(
-				EImportIssue::Data,
-				FString::Printf(TEXT("%d graphs to choose between"), Sources),
-				FString::Printf(
-					TEXT("'%s' carries %d sources and its version list didn't come across, so nothing says which it uses and the last was taken. They are the same script at different points, and another may be the one you want."),
-					*GetAssetName(), Sources)
-			);
-		}
+	if (!RestoreSource(Asset, Container)) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("Niagara script source graph is missing or ambiguous"));
 	}
 
-	UE_LOG(LogReflection, Display, TEXT("\"%s\" put %d node(s) in their graphs, made %d pin(s) and joined %d of them%s, %s%s"),
-		*GetAssetName(), Stats.Placed, Stats.Pins, Stats.Links,
-		Stats.Dangling > 0 ? *FString::Printf(TEXT(", %d reaching nothing"), Stats.Dangling) : TEXT(""),
-		bNamed ? TEXT("and took the graph its exposed version names") : *FString::Printf(TEXT("and took the last of %d source(s)"), Sources),
-		Restored > 0 ? *FString::Printf(TEXT(", and put %d field(s) back where the asset reads them"), Restored) : TEXT(""));
+	if (Stats.Dangling > 0) {
+		FImportIssues::Report(EImportIssue::Data,
+			FString::Printf(TEXT("%d Niagara graph link(s) could not be restored"), Stats.Dangling));
+	}
+}
+
+bool INiagaraScriptImporter::RestoreSource(UObject* Script, FUObjectExportContainer* Container) {
+	TArray<FNiagaraVersion> Versions = FNiagaraVersions::All(Script);
+	if (Versions.Num() == 0) {
+		if (const FNiagaraVersion Version = FNiagaraVersions::Only(Script); Version.IsValid()) Versions.Add(Version);
+	}
+
+	// On engines with an unversioned script, Source lives directly on the UObject.
+	if (Versions.Num() == 0) Versions.Add({ Script, Script->GetClass() });
+
+	TArray<UObject*> Owned;
+	TArray<UObject*> Shared;
+	UObject* Owner = Script->GetOuter();
+	for (FUObjectExport* Export : Container->Exports) {
+		UObject* Candidate = Export->Object;
+		if (Candidate == nullptr || Export->GetType() != FName(TEXT("NiagaraScriptSource"))) continue;
+
+		if (Candidate->GetOuter() == Script) Owned.Add(Candidate);
+		else if (Owner != nullptr && Candidate->GetOuter() == Owner) Shared.Add(Candidate);
+	}
+
+	const TArray<UObject*>& Candidates = Owned.Num() > 0 ? Owned : Shared;
+	UObject* Source = Candidates.Num() == 1 ? Candidates[0] : nullptr;
+
+	// A single owned source is sufficient for an unversioned script. A versioned script's
+	// revisions can have different graphs, so their serialized references are authoritative.
+	bool bComplete = true;
+	for (const FNiagaraVersion& Version : Versions) {
+		if (FNiagaraVersions::HasObject(Version, TEXT("Source"))) continue;
+		bComplete &= Versions.Num() == 1 && FNiagaraVersions::SetObject(Version, TEXT("Source"), Source);
+	}
+
+	for (const FNiagaraVersion& Version : Versions) {
+		UNiagaraScriptSource* ScriptSource = Cast<UNiagaraScriptSource>(FNiagaraVersions::GetObject(Version, TEXT("Source")));
+		if (ScriptSource == nullptr) continue;
+		if (ScriptSource->NodeGraph == nullptr) {
+			UNiagaraGraph* Graph = nullptr;
+			for (FUObjectExport* Export : Container->Exports) {
+				UNiagaraGraph* Candidate = Cast<UNiagaraGraph>(Export->Object);
+				if (Candidate == nullptr || Candidate->GetOuter() != ScriptSource) continue;
+				if (Graph != nullptr) {
+					Graph = nullptr;
+					break;
+				}
+				Graph = Candidate;
+			}
+			ScriptSource->NodeGraph = Graph;
+		}
+		bComplete &= ScriptSource->NodeGraph != nullptr;
+	}
+	return bComplete;
 }
 
 void INiagaraScriptImporter::Validate(UObject* Asset) const {

@@ -28,6 +28,8 @@ public:
 	bool ShouldDeserializeProperty(FProperty* Property) const;
 
 	void DeserializePropertyValue(FProperty* Property, const TSharedRef<FJsonValue>& Value, void* OutValue, UObject* OptionalOuter = nullptr);
+	void DeserializePropertyField(FProperty* Property, const FJsonObject& Fields, const FString& Name,
+		void* Container, UObject* OptionalOuter = nullptr);
 	void DeserializeStruct(UScriptStruct* Struct, const TSharedRef<FJsonObject>& Value, void* OutValue, UObject* OptionalOuter = nullptr) const;
 
 	/* Moves an expression input that points at a rebuilt MaterialExpressionConvert onto the root

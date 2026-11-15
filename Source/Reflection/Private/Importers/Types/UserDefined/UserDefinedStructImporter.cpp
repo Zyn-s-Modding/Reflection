@@ -3,6 +3,7 @@
 #include "Importers/Types/UserDefined/UserDefinedStructImporter.h"
 
 #include "UserDefinedStructure/UserDefinedStructEditorData.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/StructureEditorUtils.h"
 #include "UObject/StructOnScope.h"
 #include "Utilities/JsonHelpers.h"
@@ -260,13 +261,9 @@ void IUserDefinedStructImporter::ApplyDefaultValues(UUserDefinedStruct* UserDefi
 
         /* Get the default value as a string */
         FString ExportedValue;
-#if UE5_1_BEYOND
-        Property->ExportTextItem_Direct(ExportedValue, PropertyValue, nullptr, UserDefinedStruct, 0);
-#else
-        Property->ExportText_Direct(ExportedValue, PropertyValue, nullptr, UserDefinedStruct, 0);
-#endif
-
-        Variable.DefaultValue = ExportedValue;
+        if (FBlueprintEditorUtils::PropertyValueToString(Property, DefaultInstance.GetStructMemory(), ExportedValue, UserDefinedStruct)) {
+            Variable.DefaultValue = MoveTemp(ExportedValue);
+        }
     }
 }
 

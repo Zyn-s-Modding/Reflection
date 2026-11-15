@@ -34,7 +34,7 @@ namespace {
 }
 
 FBlockingRequestScope::FBlockingRequestScope(const FText& Description, const float Total, const float Done) {
-	bTracked = IsInGameThread();
+	bTracked = IsInGameThread() && !IsRunningCommandlet();
 
 	if (!bTracked) {
 		return;

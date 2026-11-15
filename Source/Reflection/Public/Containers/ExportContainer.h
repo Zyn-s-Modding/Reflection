@@ -182,7 +182,7 @@ public:
 	 *
 	 * Nothing is guessed at here: where the path does not lead to an export the reference is not
 	 * naming one of ours, and it is left to be looked for wherever else it might be. */
-	FUObjectExport* FindByFullObjectName(const FString& Named) {
+	FUObjectExport* FindByFullObjectName(const FString& Named, const FString& ObjectPath) {
 		FString Whole = StripObjectOuter(Named);
 
 		Whole.ReplaceInline(TEXT("."), TEXT(":"));
@@ -190,7 +190,7 @@ public:
 		TArray<FString> Parts;
 		Whole.ParseIntoArray(Parts, TEXT(":"), true);
 
-		if (Parts.Num() < 2) return FUObjectExport::EmptyExport();
+		if (Parts.IsEmpty()) return FUObjectExport::EmptyExport();
 
 		TArray<FName> Segments;
 
@@ -198,7 +198,30 @@ public:
 			Segments.Add(FName(*Part));
 		}
 
-		return FindByTreeSegment(Segments);
+		FString ReferencePackage;
+		if (!ObjectPath.Split(TEXT("."), &ReferencePackage, nullptr, ESearchCase::CaseSensitive, ESearchDir::FromEnd)) {
+			return FUObjectExport::EmptyExport();
+		}
+
+		for (FUObjectExport* Export : Exports) {
+			if (!Export->IsJsonValid() || Export->GetName() != Segments.Last()) continue;
+
+			FString ExportPackage;
+			if (!Export->JsonObject->TryGetStringField(TEXT("Package"), ExportPackage)) {
+				const TSharedPtr<FJsonObject>* Outer = nullptr;
+				FString OuterPath;
+				if (Export->JsonObject->TryGetObjectField(TEXT("Outer"), Outer) && (*Outer)->TryGetStringField(TEXT("ObjectPath"), OuterPath)) {
+					OuterPath.Split(TEXT("."), &ExportPackage, nullptr, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+				}
+			}
+
+			if (ExportPackage.Equals(ReferencePackage, ESearchCase::IgnoreCase)
+				&& (Segments.Num() == 1 ? Export->GetOuterTree().IsNone() : Export->GetOuterTreeSegments() == Segments)) {
+				return Export;
+			}
+		}
+
+		return FUObjectExport::EmptyExport();
 	}
 
 	FUObjectExport* GetExportByObjectPath(const TSharedPtr<FJsonObject>& Object) {

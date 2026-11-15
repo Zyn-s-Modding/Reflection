@@ -35,6 +35,8 @@ struct FNiagaraGraphStats {
  * Done once here rather than once per asset that has graphs in it. */
 class REFLECTION_API FNiagaraGraphs {
 public:
+	static bool HasSerializedPins(const FUObjectExportContainer* Container);
+
 	static void Rebuild(FUObjectExportContainer* Container, UPackage* Package,
 		UPropertySerializer* Serializer, FNiagaraGraphStats& OutStats);
 };

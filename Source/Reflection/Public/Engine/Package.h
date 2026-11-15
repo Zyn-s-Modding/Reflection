@@ -6,6 +6,7 @@
 #include "Engine/Compatibility.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Engine/FontFace.h"
+#include "NiagaraEffectType.h"
 
 #include "Engine/StaticMesh.h"
 
@@ -192,7 +193,13 @@ inline bool HandleAssetCreation(UObject* Asset, UPackage* Package, const bool bB
 	/* A font face tells Slate to drop the font it had cached, and asking for Slate where it was
 	 * never started is an assert rather than an answer. A commandlet has none, and nothing has the
 	 * old font cached there either. */
-	if (!Asset->IsA<UFontFace>() || FSlateApplication::IsInitialized()) {
+	// Niagara effect types expect MemberProperty on the change event.
+	if (Asset->IsA<UNiagaraEffectType>()) {
+		if (FProperty* Settings = FindFProperty<FProperty>(Asset->GetClass(), TEXT("UpdateFrequency"))) {
+			FPropertyChangedEvent Change(Settings);
+			Asset->PostEditChangeProperty(Change);
+		}
+	} else if (!Asset->IsA<UFontFace>() || FSlateApplication::IsInitialized()) {
 		Asset->PostEditChange();
 	}
 

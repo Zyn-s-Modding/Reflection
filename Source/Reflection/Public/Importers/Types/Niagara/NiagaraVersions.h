@@ -8,7 +8,7 @@
 struct FNiagaraVersion {
 	void* Data = nullptr;
 
-	UScriptStruct* Struct = nullptr;
+	UStruct* Struct = nullptr;
 
 	bool IsValid() const { return Data != nullptr && Struct != nullptr; }
 };

@@ -8,6 +8,9 @@
 #include "ControlRig.h"
 #include "Engine/ControlRigCompatibility.h"
 #include "Rigs/RigHierarchyController.h"
+#if UE5_4_BEYOND
+#include "Rigs/RigHierarchyMetadata.h"
+#endif
 
 #include "Engine/SkeletalMesh.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -18,41 +21,24 @@
 #include "Utilities/AssetPaths.h"
 
 namespace {
-	/* A hierarchy is written by the rig's own serializer rather than as tagged properties, so what
-	 * comes out of an export is the number an enum was stored as. The four below are the element
-	 * types Reflection can put back; the rest (rigid bodies, references, connectors and sockets)
-	 * are reported by the caller rather than guessed at. */
 	ERigElementType ToElementType(const FUObjectJsonValueExport& Key) {
-		if (!Key.JsonObject.IsValid() || !Key.Has(TEXT("Type"))) {
-			return ERigElementType::None;
-		}
+		if (!Key.JsonObject.IsValid()) return ERigElementType::None;
 
 		const TSharedPtr<FJsonValue> Type = Key.JsonObject->TryGetField(TEXT("Type"));
+		if (!Type.IsValid()) return ERigElementType::None;
 
-		/* Tagged properties spell the same enum out, which is what the class default object's
-		 * copies of these keys arrive as */
-		if (Type.IsValid() && Type->Type == EJson::String) {
+		const UEnum* Enum = StaticEnum<ERigElementType>();
+		int64 Value = INDEX_NONE;
+		if (Type->Type == EJson::String) {
 			FString Name = Type->AsString();
-
-			if (Name.Contains(TEXT("::"))) {
-				Name.Split(TEXT("::"), nullptr, &Name);
-			}
-
-			if (Name == TEXT("Bone")) return ERigElementType::Bone;
-			if (Name == TEXT("Null") || Name == TEXT("Space")) return ERigElementType::Null;
-			if (Name == TEXT("Control")) return ERigElementType::Control;
-			if (Name == TEXT("Curve")) return ERigElementType::Curve;
-
-			return ERigElementType::None;
+			Name.Split(TEXT("::"), nullptr, &Name);
+			if (Name == TEXT("Space")) Name = TEXT("Null");
+			Value = Enum->GetValueByNameString(Name);
+		} else if (Type->Type == EJson::Number) {
+			Value = static_cast<int64>(Type->AsNumber());
 		}
 
-		switch (Key.GetInteger(TEXT("Type"), 0)) {
-			case 1: return ERigElementType::Bone;
-			case 2: return ERigElementType::Null;
-			case 4: return ERigElementType::Control;
-			case 8: return ERigElementType::Curve;
-			default: return ERigElementType::None;
-		}
+		return Enum->IsValidEnumValue(Value) ? static_cast<ERigElementType>(Value) : ERigElementType::None;
 	}
 
 	FRigElementKey ReadElementKey(const FUObjectJsonValueExport& Key) {
@@ -125,10 +111,107 @@ namespace {
 		);
 	}
 
+	FRigElementWeight ReadWeight(const FUObjectJsonValueExport& Weight) {
+		return Weight.JsonObject.IsValid()
+			? FRigElementWeight(ReadNumber(Weight, TEXT("Location")), ReadNumber(Weight, TEXT("Rotation")), ReadNumber(Weight, TEXT("Scale")))
+			: FRigElementWeight();
+	}
+
+#if UE5_4_BEYOND
+	void RestoreHierarchyMetadata(URigHierarchy* Hierarchy, UPropertySerializer* Serializer,
+		const FUObjectJsonValueExport& Export) {
+		if (!Export.Has(TEXT("LoadedElementMetadata"))) return;
+
+		const UEnum* Types = StaticEnum<ERigMetadataType>();
+		int32 Missing = 0;
+		for (const FUObjectJsonValueExport& Fields : Export.GetArray(TEXT("LoadedElementMetadata"))) {
+			if (!Fields.JsonObject.IsValid()) continue;
+			FRigBaseElement* Element = Hierarchy->Find(ReadElementKey(Fields.GetObject(TEXT("Key"))));
+			const FUObjectJsonValueExport Data = Fields.GetObject(TEXT("Value")).GetObject(TEXT("MetadataMap"));
+			if (!Data.JsonObject.IsValid()) continue;
+
+			for (const auto& Pair : Data.JsonObject->Values) {
+				if (!Pair.Value.IsValid() || Pair.Value->Type != EJson::Object) continue;
+				const FUObjectJsonValueExport Field(Pair.Value->AsObject());
+				const TSharedPtr<FJsonValue> Type = Field.JsonObject->TryGetField(TEXT("Type"));
+				const TSharedPtr<FJsonValue> Value = Field.JsonObject->TryGetField(TEXT("Value"));
+				const int64 Number = Type.IsValid() && Type->Type == EJson::String
+					? Types->GetValueByNameString(Type->AsString()) : Field.GetInteger(TEXT("Type"), INDEX_NONE);
+				if (Element == nullptr || !Value.IsValid() || !Types->IsValidEnumValue(Number)
+					|| Number == static_cast<int64>(ERigMetadataType::Invalid)) {
+					Missing++;
+					continue;
+				}
+
+				FRigBaseMetadata* Metadata = Element->SetupValidMetadata(FName(*Pair.Key), static_cast<ERigMetadataType>(Number));
+				UScriptStruct* Struct = Metadata != nullptr ? Metadata->GetMetadataStruct() : nullptr;
+				FProperty* Property = Struct != nullptr ? Struct->FindPropertyByName(TEXT("Value")) : nullptr;
+				if (Property == nullptr) {
+					Missing++;
+					continue;
+				}
+
+				Serializer->DeserializePropertyValue(Property, Value.ToSharedRef(),
+					Property->ContainerPtrToValuePtr<void>(Metadata));
+			}
+		}
+		if (Missing > 0) {
+			FImportIssues::Report(EImportIssue::Data, TEXT("Some Control Rig hierarchy metadata could not be restored"),
+				FString::Printf(TEXT("%d metadata value(s)"), Missing));
+		}
+	}
+#endif
+
+	struct FRigParentDescription {
+		FRigElementKey Key;
+		FRigElementWeight InitialWeight;
+		FRigElementWeight Weight;
+	};
+
+	void AddLegacyMemory(const FUObjectExport* Class, FUObjectExportContainer* Container, const TSharedPtr<FJsonObject>& VM) {
+		const FUObjectJsonValueExport Fields = Class->AsValueExport();
+		const int32 MemoryType = Fields.GetInteger(TEXT("MemoryType"), INDEX_NONE);
+		const TCHAR* Field = MemoryType == 0 ? TEXT("DefaultWorkMemoryStorage")
+			: MemoryType == 1 ? TEXT("LiteralMemoryStorage") : nullptr;
+		if (Field == nullptr || VM->HasField(Field)) return;
+
+		const TArray<TSharedPtr<FJsonValue>>* Declared = nullptr;
+		if (!Fields.JsonObject->TryGetArrayField(TEXT("ChildProperties"), Declared)) return;
+
+		const FUObjectExport* Defaults = Container->GetExportByObjectPath(Fields.GetObject(TEXT("ClassDefaultObject")));
+		const TSharedPtr<FJsonObject> Values = Defaults->IsJsonValid() ? Defaults->GetProperties() : nullptr;
+		TArray<TSharedPtr<FJsonValue>> Registers;
+		for (const TSharedPtr<FJsonValue>& Value : *Declared) {
+			const TSharedPtr<FJsonObject>* Property = nullptr;
+			FString Name;
+			if (!Value.IsValid() || !Value->TryGetObject(Property) || !(*Property)->TryGetStringField(TEXT("Name"), Name)) {
+				Registers.Add(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>()));
+				continue;
+			}
+
+			const TSharedPtr<FJsonObject> Register = MakeShared<FJsonObject>();
+			Register->SetStringField(TEXT("Name"), Name);
+			if (Values.IsValid()) {
+				if (const TSharedPtr<FJsonValue> Default = Values->TryGetField(Name); Default.IsValid()) {
+					Register->SetField(TEXT("Tag"), Default);
+				}
+			}
+			Registers.Add(MakeShared<FJsonValueObject>(Register));
+		}
+
+		const TSharedPtr<FJsonObject> Storage = MakeShared<FJsonObject>();
+		Storage->SetArrayField(TEXT("Properties"), Registers);
+		if (const TSharedPtr<FJsonValue> Paths = Fields.JsonObject->TryGetField(TEXT("PropertyPathDescriptions")); Paths.IsValid()) {
+			Storage->SetField(TEXT("PropertyPathDescriptions"), Paths);
+		}
+		VM->SetObjectField(Field, Storage);
+	}
+
 	/* Everything one element of the export says, read once so the order they go in can be decided */
 	struct FRigElementDescription {
 		FRigElementKey Key;
 		FRigElementKey Parent;
+		TArray<FRigParentDescription> Parents;
 
 		FUObjectJsonValueExport Json;
 	};
@@ -159,14 +242,19 @@ UObject* IControlRigImporter::CreateAsset(UObject* CreatedAsset) {
 	/* The factory is what knows to give the blueprint its rig graph, which nothing else creates */
 	UFactory* Factory = RigBlueprintFactory(ParentClass);
 
-	UObject* Blueprint = Factory != nullptr ? Factory->FactoryCreateNew(
+	if (Factory == nullptr) {
+		FImportIssues::Report(EImportIssue::MissingClass, TEXT("Control Rig editor factory is unavailable"));
+		return nullptr;
+	}
+
+	UObject* Blueprint = Factory->FactoryCreateNew(
 		UControlRigBlueprint::StaticClass(),
 		GetPackage(),
 		FName(*GetAssetName()),
 		RF_Public | RF_Standalone,
 		nullptr,
 		GWarn
-	) : nullptr;
+	);
 
 	return IImporter::CreateAsset(Blueprint);
 }
@@ -175,6 +263,7 @@ bool IControlRigImporter::Import() {
 	UControlRigBlueprint* Blueprint = Create<UControlRigBlueprint>();
 	if (Blueprint == nullptr) return false;
 
+	Blueprint->MarkPackageDirty();
 	ConstructHierarchy(Blueprint);
 	ConstructSettings(Blueprint);
 
@@ -183,9 +272,8 @@ bool IControlRigImporter::Import() {
 	 * below reads and writes them, so they also have to be there before it is built. */
 	if (ConstructVariables(Blueprint) > 0) {
 		CompileBlueprintGuarded(Blueprint, EBlueprintCompileOptions::SkipGarbageCollection);
-
-		ApplyVariableDefaults(Blueprint);
 	}
+	ApplyVariableDefaults(Blueprint);
 
 	ConstructGraph(Blueprint);
 
@@ -252,23 +340,46 @@ int32 IControlRigImporter::ConstructHierarchy(UControlRigBlueprint* Blueprint) c
 		Description.Json = Json;
 		Description.Key = ReadElementKey(Json.GetObject(TEXT("LoadedKey")));
 
-		/* Bones name their parent outright. Everything else in a rig can be parented to several
-		 * elements at once, and holds pointers to them rather than their keys: what a cooked
-		 * export has to say about those is reported below rather than guessed at. */
 		Description.Parent = ReadElementKey(Json.GetObject(TEXT("ParentKey")));
+		const TArray<TSharedPtr<FJsonValue>>* Constraints = nullptr;
+		if (Json.JsonObject->TryGetArrayField(TEXT("ParentConstraints"), Constraints)) {
+			for (const TSharedPtr<FJsonValue>& Value : *Constraints) {
+				const TSharedPtr<FJsonObject>* Fields = nullptr;
+				if (!Value.IsValid() || !Value->TryGetObject(Fields)) continue;
 
-		if (!Description.Parent.IsValid()) {
-			const TArray<FUObjectJsonValueExport> Constraints = Json.Has(TEXT("ParentConstraints"))
-				? Json.GetArray(TEXT("ParentConstraints"))
-				: TArray<FUObjectJsonValueExport>();
-
-			if (Constraints.Num() > 0) {
-				Description.Parent = ReadElementKey(Constraints[0].GetObject(TEXT("ParentElement")).GetObject(TEXT("Key")));
-
-				if (!Description.Parent.IsValid()) {
-					Description.Parent = ReadElementKey(Constraints[0].GetObject(TEXT("ParentElement")));
+				const FUObjectJsonValueExport Constraint(*Fields);
+				FRigElementKey Key = ReadElementKey(Constraint.GetObject(TEXT("ParentKey")));
+				if (!Key.IsValid()) {
+					const FUObjectJsonValueExport Parent = Constraint.GetObject(TEXT("ParentElement"));
+					Key = ReadElementKey(Parent.GetObject(TEXT("LoadedKey")));
+					if (!Key.IsValid()) Key = ReadElementKey(Parent.GetObject(TEXT("Key")));
+					if (!Key.IsValid()) Key = ReadElementKey(Parent);
 				}
+				if (!Key.IsValid()) continue;
+
+				Description.Parents.Add({Key, ReadWeight(Constraint.GetObject(TEXT("InitialWeight"))),
+					ReadWeight(Constraint.GetObject(TEXT("Weight")))});
 			}
+		}
+
+		// Older Mirror exports encode the constraint's parent as an entry in IndexLookup.
+		const TArray<TSharedPtr<FJsonValue>>* Lookup = nullptr;
+		if (Description.Parents.Num() == 0 && Constraints != nullptr && Json.JsonObject->TryGetArrayField(TEXT("IndexLookup"), Lookup)) {
+			for (const TSharedPtr<FJsonValue>& Value : *Lookup) {
+				const TSharedPtr<FJsonObject>* Fields = nullptr;
+				if (!Value.IsValid() || !Value->TryGetObject(Fields)) continue;
+				const FUObjectJsonValueExport Entry(*Fields);
+				const int32 Index = Entry.GetInteger(TEXT("Value"), INDEX_NONE);
+				const FRigElementKey Key = ReadElementKey(Entry.GetObject(TEXT("Key")));
+				if (!Key.IsValid() || !Constraints->IsValidIndex(Index)) continue;
+				const FUObjectJsonValueExport Constraint((*Constraints)[Index]->AsObject());
+				Description.Parents.Add({Key, ReadWeight(Constraint.GetObject(TEXT("InitialWeight"))),
+					ReadWeight(Constraint.GetObject(TEXT("Weight")))});
+			}
+		}
+
+		if (!Description.Parent.IsValid() && Description.Parents.Num() > 0) {
+			Description.Parent = Description.Parents[0].Key;
 		}
 
 		if (!Description.Key.IsValid()) {
@@ -331,6 +442,40 @@ int32 IControlRigImporter::ConstructHierarchy(UControlRigBlueprint* Blueprint) c
 				return Controller->AddCurve(Description.Key.Name, Value, false, false).IsValid();
 			}
 
+			case ERigElementType::RigidBody: {
+				FRigRigidBodySettings Settings;
+				const FUObjectJsonValueExport Fields = Description.Json.GetObject(TEXT("Settings"));
+				if (Fields.JsonObject.IsValid()) {
+					GetPropertySerializer()->DeserializeStruct(FRigRigidBodySettings::StaticStruct(), Fields.JsonObject.ToSharedRef(), &Settings);
+				}
+				return Controller->AddRigidBody(Description.Key.Name, Description.Parent, Settings, Transform, false, false).IsValid();
+			}
+
+			case ERigElementType::Reference:
+				return Controller->AddReference(Description.Key.Name, Description.Parent, FRigReferenceGetWorldTransformDelegate(), false).IsValid();
+
+#if UE5_3_BEYOND
+			case ERigElementType::Connector: {
+				FRigConnectorSettings Settings;
+				const FUObjectJsonValueExport Fields = Description.Json.GetObject(TEXT("Settings"));
+				if (Fields.JsonObject.IsValid()) {
+					GetPropertySerializer()->DeserializeStruct(FRigConnectorSettings::StaticStruct(), Fields.JsonObject.ToSharedRef(), &Settings);
+				}
+				return Controller->AddConnector(Description.Key.Name, Settings, false, false).IsValid();
+			}
+
+			case ERigElementType::Socket: {
+				FLinearColor Color = FLinearColor::White;
+				const FUObjectJsonValueExport Fields = Description.Json.GetObject(TEXT("Color"));
+				if (Fields.JsonObject.IsValid()) {
+					GetPropertySerializer()->DeserializeStruct(TBaseStructure<FLinearColor>::Get(), Fields.JsonObject.ToSharedRef(), &Color);
+				}
+				FString DescriptionText;
+				Description.Json.JsonObject->TryGetStringField(TEXT("Description"), DescriptionText);
+				return Controller->AddSocket(Description.Key.Name, Description.Parent, Transform, false, Color, DescriptionText, false, false).IsValid();
+			}
+#endif
+
 			default: {
 				return false;
 			}
@@ -365,6 +510,8 @@ int32 IControlRigImporter::ConstructHierarchy(UControlRigBlueprint* Blueprint) c
 			if (AddElement(Description)) {
 				Added++;
 				AddedThisPass++;
+			} else {
+				Unsupported++;
 			}
 
 			Remaining.RemoveAt(Index);
@@ -379,6 +526,8 @@ int32 IControlRigImporter::ConstructHierarchy(UControlRigBlueprint* Blueprint) c
 				if (AddElement(Unparented)) {
 					Added++;
 					Orphaned++;
+				} else {
+					Unsupported++;
 				}
 			}
 
@@ -386,25 +535,31 @@ int32 IControlRigImporter::ConstructHierarchy(UControlRigBlueprint* Blueprint) c
 		}
 	}
 
-	/* Counted rather than reported one by one: a rig's controls are all in the same position */
-	int32 Parentless = 0;
 
+	int32 MissingConstraints = 0;
 	for (const FRigElementDescription& Description : Descriptions) {
-		if (!Description.Parent.IsValid() && Description.Key.Type != ERigElementType::Curve) {
-			Parentless++;
+		if (!Hierarchy->Contains(Description.Key)) continue;
+		for (const FRigParentDescription& Parent : Description.Parents) {
+			if (!Hierarchy->Contains(Parent.Key)) {
+				MissingConstraints++;
+				continue;
+			}
+
+			if (Parent.Key != Description.Parent && !Controller->AddParent(Description.Key, Parent.Key, 0.f, false, false)) {
+				MissingConstraints++;
+				continue;
+			}
+
+			Hierarchy->SetParentWeight(Description.Key, Parent.Key, Parent.InitialWeight, true);
+			Hierarchy->SetParentWeight(Description.Key, Parent.Key, Parent.Weight, false);
 		}
 	}
-
-	if (Parentless > 0) {
-		FImportIssues::Report(
-			EImportIssue::Data,
-			TEXT("Some rig elements came in without their parent"),
-			FString::Printf(
-				TEXT("%d of %d elements name no parent in the export. A rig element that can have several parents stores pointers to them rather than their names, and an export written from a cooked asset has nothing to resolve those pointers against, so they land at the top of the hierarchy."),
-				Parentless,
-				Descriptions.Num()
-			)
-		);
+#if UE5_4_BEYOND
+	RestoreHierarchyMetadata(Hierarchy, GetPropertySerializer(), HierarchyExport->AsValueExport());
+#endif
+	if (MissingConstraints > 0) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("Some Control Rig parent constraints could not be restored"),
+			FString::Printf(TEXT("%d missing or invalid constraint(s)"), MissingConstraints));
 	}
 
 	if (Orphaned > 0) {
@@ -419,7 +574,7 @@ int32 IControlRigImporter::ConstructHierarchy(UControlRigBlueprint* Blueprint) c
 		FImportIssues::Report(
 			EImportIssue::Data,
 			TEXT("The hierarchy holds elements Reflection can't rebuild"),
-			FString::Printf(TEXT("%d of them, which are neither bones, nulls, controls nor curves."), Unsupported)
+			FString::Printf(TEXT("%d element(s) have an unavailable type or could not be created."), Unsupported)
 		);
 	}
 
@@ -444,7 +599,13 @@ void IControlRigImporter::ConstructGraph(UControlRigBlueprint* Blueprint) const 
 		VirtualMachineExport = GetContainer()->FindByType(FName(TEXT("RigVM")));
 	}
 
-	if (VirtualMachineExport->IsJsonInvalid()) {
+	const FUObjectJsonValueExport EmbeddedVM = GetAssetAsValue().GetObject(TEXT("VM"));
+	FUObjectJsonValueExport VM = VirtualMachineExport->AsValueExport();
+	if (!VM.Has(TEXT("ByteCodeStorage")) && EmbeddedVM.Has(TEXT("ByteCodeStorage"))) {
+		VM = EmbeddedVM;
+	}
+
+	if (!VM.Has(TEXT("ByteCodeStorage"))) {
 		FImportIssues::Report(
 			EImportIssue::Data,
 			TEXT("The rig has no graph to rebuild"),
@@ -454,9 +615,18 @@ void IControlRigImporter::ConstructGraph(UControlRigBlueprint* Blueprint) const 
 		return;
 	}
 
+	// Older RigVM packages serialize register declarations and defaults in generated memory classes.
+	const TSharedPtr<FJsonObject> WithMemory = MakeShared<FJsonObject>(*VM.JsonObject);
+	for (const FUObjectExport* Export : GetContainer()->Exports) {
+		if (Export->GetType() == FName(TEXT("RigVMMemoryStorageGeneratorClass"))) {
+			AddLegacyMemory(Export, GetContainer(), WithMemory);
+		}
+	}
+	VM = FUObjectJsonValueExport(WithMemory);
+
 	FRigVMGraphReconstruction Reconstruction(Blueprint, GetPropertySerializer());
 
-	if (!Reconstruction.Build(VirtualMachineExport->AsValueExport())) {
+	if (!Reconstruction.Build(VM)) {
 		FImportIssues::Report(
 			EImportIssue::Data,
 			TEXT("The rig's graph couldn't be rebuilt"),
@@ -583,20 +753,14 @@ void IControlRigImporter::ApplyVariableDefaults(const UControlRigBlueprint* Blue
 
 	const TSharedPtr<FJsonObject>& Properties = DefaultObjectExport->GetProperties();
 
-	/* Only the variables this import added. The rest of what a rig's default object carries is the
-	 * rig itself, its hierarchy and its VM, which are built rather than deserialized: writing the
-	 * export's copies of those over them would leave the asset pointing at nothing. */
+	// The hierarchy and VM are reconstructed separately. Apply all other compatible defaults,
+	// including inherited rig settings that are absent from the blueprint's variable list.
 	const TSharedPtr<FJsonObject> Defaults = MakeShared<FJsonObject>();
-
-	for (const FBPVariableDescription& Variable : Blueprint->NewVariables) {
-		const FString Name = Variable.VarName.ToString();
-
-		if (!Properties->HasField(Name)) continue;
-
-		Defaults->SetField(StringToJsonKey(Name), Properties->TryGetField(Name));
+	for (const auto& Pair : Properties->Values) {
+		const FString Name = JsonKeyToString(Pair.Key);
+		if (Name == TEXT("DynamicHierarchy") || Name == TEXT("VM")) continue;
+		Defaults->SetField(Pair.Key, Pair.Value);
 	}
-
-	if (Defaults->Values.Num() == 0) return;
 
 	GetObjectSerializer()->DeserializeObjectProperties(Defaults, GeneratedClass->GetDefaultObject());
 }

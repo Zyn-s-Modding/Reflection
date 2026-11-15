@@ -152,7 +152,9 @@ void FImportIssues::Finish() {
 
 	UE_LOG(LogReflection, Warning, TEXT("Reflection finished with %d issue(s) across %d asset(s)."), NumIssues(), GAssets.Num());
 
-	SImportIssuesPanel::Open();
+	if (!IsRunningCommandlet()) {
+		SImportIssuesPanel::Open();
+	}
 }
 
 void FImportIssues::Push(const FString& Name, const FString& Path, const FString& Type) {

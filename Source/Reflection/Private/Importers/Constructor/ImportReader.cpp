@@ -428,6 +428,8 @@ IImporter* IImportReader::ReadExportAndImport(FUObjectExportContainer* Container
 		}
 	}
 
+	if (!Successful && Importer->GetAsset() == nullptr) return nullptr;
+
 	if (HideNotifications) {
 		return Importer;
 	}

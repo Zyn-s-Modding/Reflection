@@ -137,6 +137,9 @@ public class Reflection : ModuleRules {
 			"RenderCore",
 			"HTTP",
 			"Niagara",
+#if UE_5_4_OR_LATER
+			"NiagaraShader",
+#endif
 			"UnrealEd",
 			"MainFrame",
 			"AIModule",

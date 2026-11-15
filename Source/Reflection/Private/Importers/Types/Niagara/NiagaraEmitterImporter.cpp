@@ -112,7 +112,11 @@ void INiagaraEmitterImporter::Repair(UObject* Asset) const {
 		);
 	}
 
-	const int32 Restored = FNiagaraCookedCache::Restore(Container);
+	FNiagaraCookedCache::Restore(Container);
+	RestoreVersions(Asset, Container);
+}
+
+void INiagaraEmitterImporter::RestoreVersions(UObject* Asset, FUObjectExportContainer* Container) {
 
 	/* Every version the emitter keeps, not only the one it says it is now.
 	 *
@@ -125,13 +129,17 @@ void INiagaraEmitterImporter::Repair(UObject* Asset) const {
 		if (const FNiagaraVersion Made = FNiagaraVersions::Only(Asset); Made.IsValid()) Versions.Add(Made);
 	}
 
+	if (Versions.Num() == 0 && FindFProperty<FStructProperty>(Asset->GetClass(), TEXT("SpawnScriptProps")) != nullptr) {
+		Versions.Add({Asset, Asset->GetClass()});
+	}
+
 	if (Versions.Num() == 0) {
 		FImportIssues::Report(
 			EImportIssue::Data,
 			TEXT("The emitter has nowhere to put what it is made of"),
 			FString::Printf(
 				TEXT("'%s' has no version list to fill, so its scripts, graph and renderers are in the package with nothing pointing at them."),
-				*GetAssetName())
+				*Asset->GetName())
 		);
 
 		return;
@@ -191,13 +199,14 @@ void INiagaraEmitterImporter::Repair(UObject* Asset) const {
 		 * the ones written in this version's source, so a revision does not end up running
 		 * another's scripts alongside its own. */
 		for (UObject* Script : Scripts) {
-			if (Written != nullptr && SourceOfScript(Script) != Written) continue;
+			UObject* ScriptSource = SourceOfScript(Script);
+			if (Written != nullptr && ScriptSource != nullptr && ScriptSource != Written) continue;
+			if (ScriptSource == nullptr && Versions.Num() > 1) continue;
 
 			FString Field, Inner;
 
 			if (!SlotFor(UsageOf(Script), Field, Inner)) {
 				if (At == 0) Unplaced++;
-
 				continue;
 			}
 
@@ -266,18 +275,12 @@ void INiagaraEmitterImporter::Repair(UObject* Asset) const {
 			FString::Printf(TEXT("%d script(s) have nowhere to go"), Unplaced),
 			FString::Printf(
 				TEXT("'%s' holds scripts whose usage names no part of an emitter, so nothing runs them."),
-				*GetAssetName())
+				*Asset->GetName())
 		);
 	}
 
-	UE_LOG(LogReflection, Display,
-		TEXT("\"%s\" put %d node(s) in their graphs, made %d pin(s) and joined %d of them%s, and hung %d script(s), %d renderer(s) and %d scratch pad(s)%s off %d version(s)%s"),
-		*GetAssetName(), Stats.Placed, Stats.Pins, Stats.Links,
-		Stats.Dangling > 0 ? *FString::Printf(TEXT(", %d reaching nothing"), Stats.Dangling) : TEXT(""),
-		Hung, Drawn, Pads,
-		Made > 0 ? *FString::Printf(TEXT(" with %d made for want of one, of %d in the package"), Made, ScratchPads.Num()) : TEXT(""),
-		Versions.Num(),
-		Restored > 0 ? *FString::Printf(TEXT(", and put %d field(s) back where the asset reads them"), Restored) : TEXT(""));
+	UE_LOG(LogReflection, Display, TEXT("\"%s\" restored %d script(s), %d renderer(s) and %d scratch pad(s) across %d version(s)"),
+		*Asset->GetName(), Hung, Drawn, Pads + Made, Versions.Num());
 }
 
 void INiagaraEmitterImporter::Validate(UObject* Asset) const {

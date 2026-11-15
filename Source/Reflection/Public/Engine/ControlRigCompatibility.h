@@ -25,6 +25,7 @@
 
 #if REFLECTION_CONTROL_RIG
 #include "Factories/Factory.h"
+#include "Modules/ModuleManager.h"
 #include "Rigs/RigHierarchy.h"
 #endif
 
@@ -114,7 +115,8 @@ inline URigVMPin* RigExecutePin(URigVMNode* Node) {
  * either side of that, so it is asked for by class rather than by header and driven through
  * the factory interface every version shares. */
 inline UFactory* RigBlueprintFactory(UClass* ParentClass) {
-	UClass* FactoryClass = FindClassByType(TEXT("ControlRigBlueprintFactory"));
+	FModuleManager::Get().LoadModule(TEXT("ControlRigEditor"));
+	UClass* FactoryClass = FindObject<UClass>(nullptr, TEXT("/Script/ControlRigEditor.ControlRigBlueprintFactory"));
 
 	if (FactoryClass == nullptr) return nullptr;
 

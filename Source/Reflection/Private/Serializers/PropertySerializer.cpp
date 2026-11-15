@@ -1,6 +1,7 @@
 ﻿/* Copyright Reflection Contributors 2024-2026 */
 
 #include "Serializers/PropertySerializer.h"
+#include "Importers/Constructor/ImportIssues.h"
 
 #include "GameplayTagContainer.h"
 #include "GameplayTagsEditorModule.h"
@@ -28,6 +29,9 @@
 #include "Serializers/Structs/FallbackStructSerializer.h"
 #include "Serializers/Structs/ConnectivityCubeSerializer.h"
 #include "Serializers/Structs/NiagaraVariableSerializer.h"
+#if UE5_4_BEYOND
+#include "NiagaraShared.h"
+#endif
 #include "Serializers/Structs/TimeSpanSerializer.h"
 
 #include "Settings/Runtime.h"
@@ -346,6 +350,38 @@ UE_DISABLE_OPTIMIZATION
 PRAGMA_DISABLE_OPTIMIZATION
 #endif
 
+#if UE5_4_BEYOND
+namespace {
+	class FNiagaraGeneratedFunctionSerializer final : public FFallbackStructSerializer {
+	public:
+		using FFallbackStructSerializer::FFallbackStructSerializer;
+
+		void Deserialize(UScriptStruct* Struct, void* Data, const TSharedPtr<FJsonObject> Json, UObject* Outer) override {
+			FFallbackStructSerializer::Deserialize(Struct, Data, Json, Outer);
+			auto& Function = *static_cast<FNiagaraDataInterfaceGeneratedFunction*>(Data);
+			if (FString Definition; Json->TryGetStringField(TEXT("DefinitionName"), Definition)) {
+				Function.DefinitionName = FName(*Definition);
+			}
+			Json->TryGetStringField(TEXT("InstanceName"), Function.InstanceName);
+			Json->TryGetNumberField(TEXT("MiscUsageBitMask"), Function.MiscUsageBitMask);
+
+			if (const TArray<TSharedPtr<FJsonValue>>* Specifiers = nullptr; Json->TryGetArrayField(TEXT("Specifiers"), Specifiers)) {
+				Function.Specifiers.Reset(Specifiers->Num());
+				for (const TSharedPtr<FJsonValue>& Entry : *Specifiers) {
+					const TSharedPtr<FJsonObject>* Pair = nullptr;
+					FString Key;
+					FString Value;
+					if (Entry.IsValid() && Entry->TryGetObject(Pair)
+						&& (*Pair)->TryGetStringField(TEXT("Item1"), Key) && (*Pair)->TryGetStringField(TEXT("Item2"), Value)) {
+						Function.Specifiers.Emplace(FName(*Key), FName(*Value));
+					}
+				}
+			}
+		}
+	};
+}
+#endif
+
 UPropertySerializer::UPropertySerializer() {
 	FallbackStructSerializer = MakeShared<FFallbackStructSerializer>(this);
 
@@ -363,6 +399,11 @@ UPropertySerializer::UPropertySerializer() {
 	if (UScriptStruct* NiagaraVariableStruct = FindObject<UScriptStruct>(nullptr, TEXT("/Script/Niagara.NiagaraVariableBase"))) {
 		StructSerializers.Add(NiagaraVariableStruct, MakeShared<FNiagaraVariableSerializer>(this));
 	}
+#if UE5_4_BEYOND
+	if (UScriptStruct* Function = FindObject<UScriptStruct>(nullptr, TEXT("/Script/NiagaraShader.NiagaraDataInterfaceGeneratedFunction"))) {
+		StructSerializers.Add(Function, MakeShared<FNiagaraGeneratedFunctionSerializer>(this));
+	}
+#endif
 
 	/* Put down against the connectivity cube on building edit mode patterns, whose faces are bit arrays with
 	 * no reflection data to write through. Asked for rather than checked, since a build without the game
@@ -376,6 +417,30 @@ UPropertySerializer::UPropertySerializer() {
 	 * since a build without the module has no decision trees to read. */
 	if (UScriptStruct* BitArrayWrapperStruct = FindObject<UScriptStruct>(nullptr, TEXT("/Script/CharacterDynamicsControlCore.BitArrayWrapper"))) {
 		StructSerializers.Add(BitArrayWrapperStruct, MakeShared<FBitArrayWrapperSerializer>());
+	}
+}
+
+void UPropertySerializer::DeserializePropertyField(FProperty* Property, const FJsonObject& Fields,
+	const FString& Name, void* Container, UObject* OptionalOuter) {
+	const TSharedPtr<FJsonValue> Field = Fields.TryGetField(Name);
+	const TArray<TSharedPtr<FJsonValue>>* Elements = nullptr;
+	if (Property->ArrayDim > 1 && Field.IsValid() && !Property->IsA<FArrayProperty>()
+		&& !Property->IsA<FSetProperty>() && !Property->IsA<FMapProperty>()) {
+		Field->TryGetArray(Elements);
+	}
+
+	for (int32 Index = 0; Index < Property->ArrayDim; Index++) {
+		TSharedPtr<FJsonValue> Value;
+		if (Elements != nullptr && Elements->IsValidIndex(Index)) {
+			Value = (*Elements)[Index];
+		} else if (Index == 0 && Field.IsValid() && Elements == nullptr) {
+			Value = Field;
+		} else if (Property->ArrayDim > 1) {
+			Value = Fields.TryGetField(FString::Printf(TEXT("%s[%d]"), *Name, Index));
+		}
+		if (Value.IsValid()) {
+			DeserializePropertyValue(Property, Value.ToSharedRef(), Property->ContainerPtrToValuePtr<void>(Container, Index), OptionalOuter);
+		}
 	}
 }
 
@@ -398,6 +463,7 @@ void UPropertySerializer::DeserializePropertyValue(FProperty* Property, const TS
 		FProperty* KeyProperty = MapProperty->KeyProp;
 		FProperty* ValueProperty = MapProperty->ValueProp;
 		FScriptMapHelper MapHelper(MapProperty, OutValue);
+		MapHelper.EmptyValues();
 
 		/* A map whose values are simple enough to write inline comes through as a json object keyed
 		 * by the map key ({"Mobile": 1}), and one whose values are not comes through as an array of
@@ -431,7 +497,7 @@ void UPropertySerializer::DeserializePropertyValue(FProperty* Property, const TS
 
 			/* Copy over imported key and value from temporary storage */
 			DeserializePropertyValue(KeyProperty, EntryKey.ToSharedRef(), PairPtr);
-			DeserializePropertyValue(ValueProperty, EntryValue.ToSharedRef(), PairPtr + MapHelper.MapLayout.ValueOffset);
+			DeserializePropertyValue(ValueProperty, EntryValue.ToSharedRef(), PairPtr + MapHelper.MapLayout.ValueOffset, OptionalOuter);
 		}
 		MapHelper.Rehash();
 
@@ -666,8 +732,10 @@ void UPropertySerializer::DeserializePropertyValue(FProperty* Property, const TS
 			 * back empty, and the properties they were for were left holding nothing. */
 			FString Reference;
 
-			if (ExportsContainer != nullptr && JsonValueAsObject->TryGetStringField(TEXT("ObjectName"), Reference)) {
-				FUObjectExport* Held = ExportsContainer->FindByFullObjectName(Reference);
+			FString ReferencePath;
+			if (ExportsContainer != nullptr && JsonValueAsObject->TryGetStringField(TEXT("ObjectName"), Reference)
+				&& JsonValueAsObject->TryGetStringField(TEXT("ObjectPath"), ReferencePath)) {
+				FUObjectExport* Held = ExportsContainer->FindByFullObjectName(Reference, ReferencePath);
 
 				/* Built now where it has not been yet.
 				 *
@@ -1267,7 +1335,8 @@ void UPropertySerializer::DeserializePropertyValue(FProperty* Property, const TS
 	}
 #endif
 	else {
-		UE_LOG(LogReflectionPropertySerializer, Fatal, TEXT("Found unsupported property type when deserializing value: %s"), *Property->GetClass()->GetName());
+		FImportIssues::Report(EImportIssue::Data, TEXT("Unsupported property type"),
+			FString::Printf(TEXT("%s (%s)"), *Property->GetName(), *Property->GetClass()->GetName()));
 	}
 }
 

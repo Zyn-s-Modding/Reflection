@@ -3,6 +3,7 @@
 #include "Importers/Types/Niagara/NiagaraGraphs.h"
 
 #include "Engine/EngineUtilities.h"
+#include "Importers/Constructor/Importer.h"
 #include "Serializers/PropertySerializer.h"
 
 #include "EdGraph/EdGraph.h"
@@ -14,6 +15,11 @@
 #include "NiagaraNodeOutput.h"
 #include "NiagaraNodeFunctionCall.h"
 #include "NiagaraScriptSource.h"
+#if UE5_4_BEYOND
+#include "EdGraphSchema_Niagara.h"
+#include "Interfaces/IPluginManager.h"
+#include "NiagaraScriptVariable.h"
+#endif
 
 namespace {
 	/* The object a reference names, by the whole path under the package rather than its leaf.
@@ -43,13 +49,30 @@ namespace {
 
 		FString Said;
 
-		if (Object->TryGetStringField(TEXT("CultureInvariantString"), Said)
-			|| Object->TryGetStringField(TEXT("SourceString"), Said)) {
-			return FText::FromString(Said);
+		if (Object->TryGetStringField(TEXT("CultureInvariantString"), Said)) {
+			return FText::AsCultureInvariant(Said);
+		}
+
+		if (Object->TryGetStringField(TEXT("SourceString"), Said)) {
+			FString Namespace;
+			FString Key;
+			const FText Source = FText::FromString(Said);
+			if (Object->TryGetStringField(TEXT("Namespace"), Namespace) && Object->TryGetStringField(TEXT("Key"), Key)) {
+				return FText::ChangeKey(Namespace, Key, Source);
+			}
+			return Source;
 		}
 
 		return FText::GetEmpty();
 	}
+
+	template <typename TPin>
+	auto RestoreSourceIndex(TPin* Pin, const FJsonObject& Entry, int) -> decltype(Pin->SourceIndex, void()) {
+		Entry.TryGetNumberField(TEXT("SourceIndex"), Pin->SourceIndex);
+	}
+
+	template <typename TPin>
+	void RestoreSourceIndex(TPin*, const FJsonObject&, long) {}
 
 	/* The pins an export lists, or nothing where it lists none */
 	const TArray<TSharedPtr<FJsonValue>>* PinsOf(const FUObjectExport* Export) {
@@ -82,47 +105,141 @@ namespace {
 		return Call->GetCalledGraph();
 #endif
 	}
+
+#if UE5_4_BEYOND
+	void RestoreAddedFunctionOutputs(UNiagaraNodeFunctionCall* Call, const UNiagaraGraph* Called) {
+		const UNiagaraNodeOutput* FunctionOutput = nullptr;
+		for (const UEdGraphNode* Node : Called->Nodes) {
+			const UNiagaraNodeOutput* Output = Cast<UNiagaraNodeOutput>(Node);
+			if (Output == nullptr) continue;
+			if (FunctionOutput != nullptr) return;
+			FunctionOutput = Output;
+		}
+		if (FunctionOutput == nullptr) return;
+		const auto& Outputs = FunctionOutput->Outputs;
+
+		TArray<UEdGraphPin*> Pins;
+		for (UEdGraphPin* Pin : Call->Pins) {
+			if (Pin != nullptr && Pin->Direction == EGPD_Output && !Pin->bOrphanedPin) Pins.Add(Pin);
+		}
+		if (Pins.IsEmpty() || Pins.Num() >= Outputs.Num()) return;
+
+		// Update only when the target added outputs and the full source signature
+		// still matches its prefix. Existing pins keep their IDs and connections.
+		for (int32 Index = 0; Index < Pins.Num(); ++Index) {
+			if (Pins[Index]->PinName != Outputs[Index].GetName() ||
+				Pins[Index]->PinType != UEdGraphSchema_Niagara::TypeDefinitionToPinType(Outputs[Index].GetType())) return;
+		}
+		for (int32 Index = Pins.Num(); Index < Outputs.Num(); ++Index) {
+			const FNiagaraVariable& Output = Outputs[Index];
+			UEdGraphPin* Pin = Call->CreatePin(EGPD_Output,
+				UEdGraphSchema_Niagara::TypeDefinitionToPinType(Output.GetType()), Output.GetName());
+			Pin->bDefaultValueIsIgnored = true;
+		}
+	}
 #endif
+#endif
+}
+
+bool FNiagaraGraphs::HasSerializedPins(const FUObjectExportContainer* Container) {
+	if (Container == nullptr) return false;
+
+	int32 Missing = 0;
+	int32 Nodes = 0;
+	for (FUObjectExport* Export : Container->Exports) {
+		if (!Export->IsJsonValid()) continue;
+		const UClass* Class = Export->GetClass();
+		const auto* Pins = PinsOf(Export);
+		if (Pins == nullptr && (Class == nullptr || !Class->IsChildOf(UEdGraphNode::StaticClass()))) continue;
+
+		Nodes++;
+		if (Pins == nullptr) Missing++;
+	}
+
+	if (Missing > 0 || Nodes == 0) {
+		const FString Detail = Nodes == 0 ? TEXT("No graph nodes were present in the export.")
+			: FString::Printf(TEXT("%d of %d node exports lack serialized pins."), Missing, Nodes);
+		UE_LOG(LogReflection, Warning, TEXT("Niagara editor graph data could not be read. %s"), *Detail);
+		FImportIssues::Report(EImportIssue::Data, TEXT("Niagara editor graph data could not be read"), Detail);
+		return false;
+	}
+	return true;
 }
 
 void FNiagaraGraphs::Rebuild(FUObjectExportContainer* Container, UPackage* Package,
 	UPropertySerializer* Serializer, FNiagaraGraphStats& OutStats) {
 	if (Container == nullptr) return;
 
-	/* What each graph holds, taken from the nodes sitting under it rather than from the list it
-	 * carries.
-	 *
-	 * A script keeps a graph per version of itself and they are copies, so the same node name is
-	 * in each. The list names them by a reference that has to be resolved back to one of them, and
-	 * one resolved by name alone lands in whichever copy was read last: the graphs come out with
-	 * the right number of nodes between them and the wrong ones in each. What is under a graph is
-	 * not open to that, so the list is made again from that. */
+	// Keep the serialized node order where the references resolve, and recover
+	// any missing entries from the exports actually owned by this graph.
 	for (FUObjectExport* Export : Container->Exports) {
 		UEdGraph* Graph = Cast<UEdGraph>(Export->Object);
 
 		if (Graph == nullptr) continue;
 
-		Graph->Nodes.Reset();
+		TSet<UEdGraphNode*> Placed;
+		Graph->Nodes.RemoveAll([&](UEdGraphNode* Node) {
+			if (Node == nullptr || Node->GetOuter() != Graph || Placed.Contains(Node)) return true;
+			Placed.Add(Node);
+			return false;
+		});
 
 		for (FUObjectExport* Under : Container->Exports) {
 			UEdGraphNode* Beneath = Cast<UEdGraphNode>(Under->Object);
 
-			if (Beneath != nullptr && Beneath->GetOuter() == Graph) {
+			if (Beneath != nullptr && Beneath->GetOuter() == Graph && !Placed.Contains(Beneath)) {
 				Graph->Nodes.Add(Beneath);
-
-				OutStats.Placed++;
+				Placed.Add(Beneath);
 			}
 		}
+		OutStats.Placed += Placed.Num();
+
+#if UE5_4_BEYOND && WITH_EDITORONLY_DATA
+		if (UNiagaraGraph* NiagaraGraph = Cast<UNiagaraGraph>(Graph)) {
+			// Older graphs may mark the switch only on its node. Set the metadata
+			// on the editable graph before the compiler duplicates it.
+			TSet<FName> SwitchNames;
+			for (const FNiagaraVariable& Switch : NiagaraGraph->FindStaticSwitchInputs()) {
+				SwitchNames.Add(Switch.GetName());
+			}
+			for (const UEdGraphNode* Node : Graph->Nodes) {
+				// Compiler constants and switches exposed as pins are excluded from
+				// FindStaticSwitchInputs, but the node's PostLoad checks these too.
+				const FNameProperty* InputName = FindFProperty<FNameProperty>(Node->GetClass(), TEXT("InputParameterName"));
+				if (InputName != nullptr && FindFProperty<FStructProperty>(Node->GetClass(), TEXT("SwitchTypeData")) != nullptr) {
+					SwitchNames.Add(InputName->GetPropertyValue_InContainer(Node));
+				}
+			}
+			for (const auto& Entry : NiagaraGraph->GetAllMetaData()) {
+				if (Entry.Value != nullptr && SwitchNames.Contains(Entry.Key.GetName())) {
+					Entry.Value->SetIsStaticSwitch(true);
+				}
+			}
+		}
+#endif
 	}
 
 	/* Every pin the export lists, made on the node that owns it. Kept against the node and the id
 	 * it was written with, because that pair is what a link names. */
 	TMap<TPair<FString, FGuid>, UEdGraphPin*> Made;
+	auto FindPin = [&Made](const TSharedPtr<FJsonValue>& Value) -> UEdGraphPin* {
+		const TSharedPtr<FJsonObject>* Reference = nullptr;
+		const TSharedPtr<FJsonObject>* Owner = nullptr;
+		FString Id;
+		if (!Value.IsValid() || !Value->TryGetObject(Reference)
+			|| !(*Reference)->TryGetStringField(TEXT("PinId"), Id)
+			|| !(*Reference)->TryGetObjectField(TEXT("OwningNode"), Owner)) return nullptr;
+
+		return Made.FindRef(TPair<FString, FGuid>(ReferencedPath(*Owner), StringToGuid(Id)));
+	};
 
 	for (FUObjectExport* Export : Container->Exports) {
 		UEdGraphNode* Node = Cast<UEdGraphNode>(Export->Object);
 
 		if (Node == nullptr) continue;
+
+		const TArray<TSharedPtr<FJsonValue>>* Listed = PinsOf(Export);
+		if (Listed == nullptr) continue;
 
 		/* A node holding pins already is one this has been over before, and it is gone over again
 		 * whenever something asks for the asset a second time.
@@ -148,10 +265,6 @@ void FNiagaraGraphs::Rebuild(FUObjectExportContainer* Container, UPackage* Packa
 			UEdGraphNode::DestroyPin(Pin);
 		}
 
-		const TArray<TSharedPtr<FJsonValue>>* Listed = PinsOf(Export);
-
-		if (Listed == nullptr) continue;
-
 		for (const TSharedPtr<FJsonValue>& Value : *Listed) {
 			const TSharedPtr<FJsonObject> Entry = Value.IsValid() ? Value->AsObject() : nullptr;
 
@@ -176,6 +289,8 @@ void FNiagaraGraphs::Rebuild(FUObjectExportContainer* Container, UPackage* Packa
 
 			if (Pin == nullptr) continue;
 
+			RestoreSourceIndex(Pin, *Entry, 0);
+
 			/* Kept as it was written, since a link names the id and not the name */
 			if (FString Id; Entry->TryGetStringField(TEXT("PinId"), Id)) {
 				Pin->PinId = StringToGuid(Id);
@@ -198,16 +313,36 @@ void FNiagaraGraphs::Rebuild(FUObjectExportContainer* Container, UPackage* Packa
 			 * one number in an order it keeps fixed on purpose, and reads them back out of the
 			 * same places. A pin made without them shows where the original hid it and takes a
 			 * connection where the original refused one. */
+#if WITH_EDITORONLY_DATA
 			if (int32 Flags = 0; Entry->TryGetNumberField(TEXT("BitField"), Flags)) {
 				Pin->bHidden = (Flags & 1 << 0) != 0;
 				Pin->bNotConnectable = (Flags & 1 << 1) != 0;
 				Pin->bDefaultValueIsReadOnly = (Flags & 1 << 2) != 0;
 				Pin->bDefaultValueIsIgnored = (Flags & 1 << 3) != 0;
 				Pin->bAdvancedView = (Flags & 1 << 4) != 0;
+				Pin->bOrphanedPin = (Flags & 1 << 5) != 0;
 			}
+#endif
 
 			if (const TSharedPtr<FJsonValue> Friendly = Entry->TryGetField(TEXT("PinFriendlyName")); Friendly.IsValid()) {
 				Pin->PinFriendlyName = TextOf(Friendly);
+			}
+			if (const TSharedPtr<FJsonValue> Default = Entry->TryGetField(TEXT("DefaultTextValue")); Default.IsValid()) {
+				Pin->DefaultTextValue = TextOf(Default);
+			}
+			if (const TSharedPtr<FJsonObject>* Default = nullptr; Entry->TryGetObjectField(TEXT("DefaultObject"), Default)) {
+				FString Name;
+				FString Path;
+				TObjectPtr<UObject> Object;
+				if ((*Default)->TryGetStringField(TEXT("ObjectName"), Name) && (*Default)->TryGetStringField(TEXT("ObjectPath"), Path)) {
+					if (FUObjectExport* Local = Container->FindByFullObjectName(Name, Path); Local->IsJsonValid()) {
+						Object = Local->Object;
+					} else {
+						IImporter Importer;
+						Importer.LoadExport(Default, Object);
+					}
+				}
+				Pin->DefaultObject = Object;
 			}
 
 			Entry->TryGetStringField(TEXT("DefaultValue"), Pin->DefaultValue);
@@ -327,39 +462,43 @@ void FNiagaraGraphs::Rebuild(FUObjectExportContainer* Container, UPackage* Packa
 
 			UEdGraphPin** From = Made.Find(TPair<FString, FGuid>(Export->Object->GetPathName(Package), StringToGuid(Id)));
 
-			const TArray<TSharedPtr<FJsonValue>>* Joined = nullptr;
+			if (From == nullptr) continue;
+			UEdGraphPin* Pin = *From;
+			auto Resolve = [&](const TSharedPtr<FJsonValue>& Reference) {
+				UEdGraphPin* Resolved = FindPin(Reference);
+				if (Reference.IsValid() && !Reference->IsNull() && Resolved == nullptr) OutStats.Dangling++;
+				return Resolved;
+			};
 
-			if (From == nullptr || !Entry->TryGetArrayField(TEXT("LinkedTo"), Joined)) continue;
-
-			for (const TSharedPtr<FJsonValue>& One : *Joined) {
-				const TSharedPtr<FJsonObject> Link = One.IsValid() ? One->AsObject() : nullptr;
-
-				if (!Link.IsValid()) continue;
-
-				FString Other;
-
-				const TSharedPtr<FJsonObject>* Owner = nullptr;
-
-				if (!Link->TryGetStringField(TEXT("PinId"), Other) || !Link->TryGetObjectField(TEXT("OwningNode"), Owner)) {
-					continue;
+			Pin->ParentPin = Resolve(Entry->TryGetField(TEXT("ParentPin")));
+			Pin->ReferencePassThroughConnection = Resolve(Entry->TryGetField(TEXT("ReferencePassThroughConnection")));
+			if (const TArray<TSharedPtr<FJsonValue>>* SubPins = nullptr; Entry->TryGetArrayField(TEXT("SubPins"), SubPins)) {
+				for (const TSharedPtr<FJsonValue>& One : *SubPins) {
+					if (UEdGraphPin* SubPin = Resolve(One)) Pin->SubPins.Add(SubPin);
 				}
+			}
 
-				UEdGraphPin** To = Made.Find(TPair<FString, FGuid>(ReferencedPath(*Owner), StringToGuid(Other)));
-
-				/* A link onto a pin that isn't here, which is a node the build hasn't got */
-				if (To == nullptr) {
-					OutStats.Dangling++;
-
-					continue;
-				}
-
-				/* Both ends list each other, so the second time round the pair is already joined */
-				if (!(*From)->LinkedTo.Contains(*To)) {
-					(*From)->MakeLinkTo(*To);
-
-					OutStats.Links++;
+			if (const TArray<TSharedPtr<FJsonValue>>* Linked = nullptr; Entry->TryGetArrayField(TEXT("LinkedTo"), Linked)) {
+				for (const TSharedPtr<FJsonValue>& One : *Linked) {
+					if (UEdGraphPin* To = Resolve(One)) {
+						Pin->LinkedTo.Add(To);
+						OutStats.Links++;
+					}
 				}
 			}
 		}
 	}
+
+#if UE5_4_BEYOND && WITH_EDITORONLY_DATA
+	for (FUObjectExport* Export : Container->Exports) {
+		UNiagaraNodeFunctionCall* Call = Cast<UNiagaraNodeFunctionCall>(Export->Object);
+		if (Call == nullptr || Call->FunctionScript == nullptr || Call->FunctionScript->GetOutermost() == Package) continue;
+		const FString FunctionPackage = Call->FunctionScript->GetOutermost()->GetName();
+		FString Mount;
+		if (!FunctionPackage.Mid(1).Split(TEXT("/"), &Mount, nullptr)) continue;
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(Mount);
+		if (Mount != TEXT("Engine") && (!Plugin.IsValid() || Plugin->GetLoadedFrom() != EPluginLoadedFrom::Engine)) continue;
+		if (const UNiagaraGraph* Called = CalledGraphOf(Call)) RestoreAddedFunctionOutputs(Call, Called);
+	}
+#endif
 }

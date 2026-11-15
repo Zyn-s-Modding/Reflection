@@ -2,8 +2,10 @@
 
 #include "Serializers/Structs/NiagaraVariableSerializer.h"
 #include "Dom/JsonObject.h"
+#include "Misc/Base64.h"
 
 #include "Engine/Compatibility.h"
+#include "Importers/Constructor/Importer.h"
 
 #include "NiagaraTypes.h"
 
@@ -76,6 +78,13 @@ namespace {
 #endif
 		} else if (Kind == UnderlyingEnum) {
 			UEnum* Enum = Full.IsEmpty() ? nullptr : FindObject<UEnum>(nullptr, *Full);
+			if (Enum == nullptr && Module.StartsWith(TEXT("/")) && !Module.StartsWith(TEXT("/Script/"))) {
+				const FString PackagePath = Module.Contains(TEXT(".")) ? Module.Left(Module.Find(TEXT("."))) : Module;
+				Enum = LoadObjectByPath<UEnum>(PackagePath + TEXT(".") + Leaf);
+				if (Enum == nullptr) {
+					Enum = Cast<UEnum>(IImporter::DownloadWrapper(TObjectPtr<UObject>(), TEXT("UserDefinedEnum"), Leaf, PackagePath).Get());
+				}
+			}
 
 			if (Enum == nullptr) Enum = FindEnumByType(Leaf);
 			if (Enum == nullptr) return false;
@@ -103,11 +112,13 @@ namespace {
 }
 
 void FNiagaraVariableSerializer::Deserialize(UScriptStruct* Struct, void* StructData, const TSharedPtr<FJsonObject> JsonValue, UObject* OptionalOuter) {
-	Fallback.Deserialize(Struct, StructData, JsonValue, OptionalOuter);
-
 	if (Struct == nullptr || StructData == nullptr || !JsonValue.IsValid()) return;
 
-	if (FNiagaraTypeDefinition Type; ReadType(JsonValue, Type)) {
+	Fallback.Deserialize(Struct, StructData, JsonValue, OptionalOuter);
+
+	FNiagaraTypeDefinition Type;
+	const bool bHasType = ReadType(JsonValue, Type);
+	if (bHasType) {
 /* 4.25 split the name and type of a variable out into a base of its own */
 #if UE4_24_BELOW
 		static_cast<FNiagaraVariable*>(StructData)->SetType(Type);
@@ -116,9 +127,26 @@ void FNiagaraVariableSerializer::Deserialize(UScriptStruct* Struct, void* Struct
 #endif
 	}
 
-	/* A value the size of the type it is now. One written at another size is a value nothing can
-	 * read, and a variable that arrived with none had none to write. */
-	if (Struct->IsChildOf(FNiagaraVariable::StaticStruct())) {
-		static_cast<FNiagaraVariable*>(StructData)->AllocateData();
+	if (!bHasType || !Struct->IsChildOf(FNiagaraVariable::StaticStruct())) return;
+
+	FNiagaraVariable* Variable = static_cast<FNiagaraVariable*>(StructData);
+	const TSharedPtr<FJsonValue> Data = JsonValue->TryGetField(TEXT("VarData"));
+	if (!Data.IsValid() || Data->IsNull()) return;
+
+	TArray<uint8> Bytes;
+	FString Encoded;
+	const TArray<TSharedPtr<FJsonValue>>* Listed = nullptr;
+	if (Data->TryGetString(Encoded)) {
+		if (!FBase64::Decode(Encoded, Bytes)) return;
+	} else if (Data->TryGetArray(Listed)) {
+		for (const TSharedPtr<FJsonValue>& Element : *Listed) {
+			double Value = 0;
+			if (!Element.IsValid() || !Element->TryGetNumber(Value) || Value < 0 || Value > 255) return;
+			Bytes.Add(static_cast<uint8>(Value));
+		}
+	}
+
+	if (Bytes.Num() > 0 && Bytes.Num() == Type.GetSize()) {
+		Variable->SetData(Bytes.GetData());
 	}
 }

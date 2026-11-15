@@ -58,6 +58,8 @@ inline void SetNotificationSubText(FNotificationInfo& Notification, const FText&
  * by that nested tick and torn down by the outer one, and the double free lands seconds later
  * when the notification expires, nowhere near the code that caused it. */
 inline TSharedPtr<SNotificationItem> AddNotificationWhenSafe(const FNotificationInfo& Info, const SNotificationItem::ECompletionState CompletionState) {
+	if (IsRunningCommandlet()) return nullptr;
+
 	if (FBlockingRequestScope::IsActive() && GEditor != nullptr) {
 		NotificationBudget::Pending++;
 

@@ -17,6 +17,14 @@
 #include "Serializers/PropertySerializer.h"
 
 namespace {
+	template <typename TPin>
+	auto HasFixedSize(const TPin* Pin, int) -> decltype(Pin->IsFixedSizeArray()) {
+		return Pin->IsFixedSizeArray();
+	}
+
+	template <typename TPin>
+	bool HasFixedSize(const TPin*, long) { return false; }
+
 	/* The registry grew a read and a write half in 5.5, but the half it hands out keeps the
 	 * locking accessors and deletes the unlocked ones, so the plain registry is what every
 	 * version is asked for. */
@@ -873,7 +881,9 @@ void FRigVMGraphReconstruction::CreateNodes() {
 		}
 
 		for (const TPair<FString, int32>& ArraySize : ArraySizes) {
-			if (const URigVMPin* ArrayPin = Node.Node->FindPin(ArraySize.Key)) {
+			if (const URigVMPin* ArrayPin = Node.Node->FindPin(ArraySize.Key);
+				ArrayPin != nullptr && ArrayPin->IsArray()
+				&& (ArrayPin->GetDirection() != ERigVMPinDirection::Output || HasFixedSize(ArrayPin, 0))) {
 				Controller->SetArrayPinSize(ArrayPin->GetPinPath(), ArraySize.Value, FString(), false, false);
 			}
 		}
@@ -886,6 +896,8 @@ bool FRigVMGraphReconstruction::SetPinDefault(URigVMPin* Pin, const TSharedPtr<F
 	}
 
 	if (Value->Type == EJson::Array) {
+		if (!Pin->IsArray() || (Pin->GetDirection() == ERigVMPinDirection::Output && !HasFixedSize(Pin, 0))) return false;
+
 		const TArray<TSharedPtr<FJsonValue>>& Elements = Value->AsArray();
 
 		if (!Controller->SetArrayPinSize(Pin->GetPinPath(), Elements.Num(), FString(), false, false)) {
