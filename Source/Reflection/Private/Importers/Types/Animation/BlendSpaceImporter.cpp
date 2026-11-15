@@ -63,6 +63,7 @@ bool IBlendSpaceImporter::Import() {
 
 	ResolveEmptySamples(BlendSpace);
 	AlignGridToEngine(BlendSpace);
+	UpgradeFromOlderEngine(BlendSpace);
 
 	/* Ensure internal state is refreshed after adding all samples */
 	BlendSpace->ValidateSampleData();
@@ -196,6 +197,44 @@ void IBlendSpaceImporter::AlignGridToEngine(UReflectionBlendSpace* BlendSpace) {
 
 	UE_LOG(LogReflection, Display, TEXT("\"%s\" was cooked for the other engine's grid order, and its %d points were put back"),
 		*GetAssetName(), Reordered.Num());
+#endif
+}
+
+void IBlendSpaceImporter::UpgradeFromOlderEngine(UReflectionBlendSpace* BlendSpace) {
+#if ENGINE_UE5
+	/* An export from 5.0 or later carries the triangulation it was saved with, and that is used as
+	 * it stands. Its absence is what the engine's own version check stands for. */
+	if (GetAssetData()->HasField(TEXT("BlendSpaceData"))) return;
+
+	UClass* Class = UBlendSpace::StaticClass();
+
+	/* UBlendSpace::Serialize, below BlendSpaceRuntimeTriangulation: an old blend space keeps
+	 * interpolating on the grid, and keeps the constant weight speed it was tuned with. Both are
+	 * protected, so they are written through their properties. */
+	if (FBoolProperty* UseGrid = FindFProperty<FBoolProperty>(Class, TEXT("bInterpolateUsingGrid"))) {
+		UseGrid->SetPropertyValue_InContainer(BlendSpace, true);
+	}
+
+	if (FBoolProperty* EaseInOut = FindFProperty<FBoolProperty>(Class, TEXT("bTargetWeightInterpolationEaseInOut"))) {
+		EaseInOut->SetPropertyValue_InContainer(BlendSpace, false);
+	}
+
+	/* Below BlendSpaceSmoothingImprovements: spring damper with a time set can only be the old
+	 * default standing in for averaging, and cubic smoothing never cubed its time */
+	if (FStructProperty* Smoothing = FindFProperty<FStructProperty>(Class, TEXT("InterpolationParam"))) {
+		for (int32 Index = 0; Index < Smoothing->ArrayDim; Index++) {
+			FInterpolationParameter* Parameter = Smoothing->ContainerPtrToValuePtr<FInterpolationParameter>(BlendSpace, Index);
+
+			if (Parameter->InterpolationType == EFilterInterpolationType::BSIT_SpringDamper && Parameter->InterpolationTime > 0.0f) {
+				Parameter->InterpolationType = EFilterInterpolationType::BSIT_Average;
+			} else if (Parameter->InterpolationType == EFilterInterpolationType::BSIT_Cubic) {
+				Parameter->InterpolationTime = FMath::Pow(Parameter->InterpolationTime, 1.0f / 3.0f);
+			}
+		}
+	}
+
+	/* And the data itself, which is the grid and the triangulation both */
+	BlendSpace->ResampleData();
 #endif
 }
 

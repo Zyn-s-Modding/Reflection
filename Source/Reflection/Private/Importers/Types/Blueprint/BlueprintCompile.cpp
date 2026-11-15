@@ -19,6 +19,7 @@
 #include "Kismet/KismetNodeHelperLibrary.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "HAL/IConsoleManager.h"
 #include "Misc/FeedbackContext.h"
 #include "Misc/SlowTask.h"
 
@@ -558,6 +559,27 @@ static void SettleEnumExecs(UBlueprint* Blueprint) {
 	}
 }
 
+/* Where a gameplay effect keeps the shape its settings were last saved in.
+ *
+ * The engine holds it in a struct of one byte that it reads and writes itself, and deliberately gives
+ * no property for, so there is nothing to ask for by name inside the struct: the byte is the struct.
+ * Nothing is returned for a struct of any other size, since that would be an engine this was not
+ * written against. */
+static uint8* EffectVersionAt(const UClass* Class, UObject* Defaults) {
+	const FStructProperty* Version = FindFProperty<FStructProperty>(Class, TEXT("DataVersion"));
+
+	if (Version == nullptr || Version->Struct == nullptr || Version->Struct->GetStructureSize() != sizeof(uint8)) return nullptr;
+
+	return Version->ContainerPtrToValuePtr<uint8>(Defaults);
+}
+
+/* The newest shape the engine will bring an effect up to, which is two unless it has been told less */
+static uint8 NewestEffectVersion() {
+	const IConsoleVariable* Most = IConsoleManager::Get().FindConsoleVariable(TEXT("AbilitySystem.GameplayEffects.MaxVersion"));
+
+	return Most != nullptr ? static_cast<uint8>(FMath::Clamp(Most->GetInt(), 0, 255)) : 2;
+}
+
 /* The parts of a gameplay effect, named so a child finds its parent's.
  *
  * This engine keeps what an effect does in components, and makes them from the older settings the
@@ -587,6 +609,33 @@ static void SettleEffectComponents(const UBlueprint* Blueprint) {
 
 	if (Defaults == nullptr || Part == nullptr) return;
 
+	/* Made out of the old settings, whatever the effect says of itself.
+	 *
+	 * What was read out of the game is the old settings. The engine turns those into components when
+	 * the effect is compiled, but only for an effect that says it is still the old shape, and one whose
+	 * package has never been saved starts out saying it is the new one: nothing would be made of its
+	 * settings at all, and saving it would then clear them. Said to be old and asked again, it is made
+	 * the same way every time. An effect that already has its components is only written to again. */
+	uint8* Shape = EffectVersionAt(Class, Defaults);
+
+	if (FParse::Param(FCommandLine::Get(), TEXT("effectparts"))) {
+		FScriptArrayHelper Now(Parts, Parts->ContainerPtrToValuePtr<void>(Defaults));
+
+		FString Names;
+
+		for (int32 Index = 0; Index < Now.Num(); Index++) {
+			Names += GetNameSafe(Part->GetObjectPropertyValue(Now.GetRawPtr(Index))) + TEXT(" ");
+		}
+
+		UE_LOG(LogReflection, Display, TEXT("\"%s\" says it is shape %d going in and holds: %s"), *Blueprint->GetName(), Shape != nullptr ? *Shape : -1, *Names);
+	}
+
+	if (Shape != nullptr) {
+		*Shape = 0;
+
+		Defaults->PostCDOCompiled(UObject::FPostCDOCompiledContext());
+	}
+
 	UObject* Parent = Defaults->GetArchetype();
 
 	/* What the parent keeps, by kind: the name each of those goes by is the name the child's has to */
@@ -610,8 +659,8 @@ static void SettleEffectComponents(const UBlueprint* Blueprint) {
 	 *
 	 * A child that was already loaded when its parent was brought in again is left holding the
 	 * component the parent had before, and compiling it copies the parent's new one in beside that.
-	 * The one that is not the parent's copy is the one carrying what the child itself was set to, so
-	 * that is the one kept, and it takes the parent's name below. */
+	 * The first of a kind is the one the engine writes the effect's settings to and reads them back
+	 * from, every time it is compiled, so that is the one kept, and it takes the parent's name below. */
 	TMap<const UClass*, TArray<int32>> Kinds;
 
 	for (int32 Index = 0; Index < Held.Num(); Index++) {
@@ -625,19 +674,7 @@ static void SettleEffectComponents(const UBlueprint* Blueprint) {
 	for (const TPair<const UClass*, TArray<int32>>& Kind : Kinds) {
 		if (Kind.Value.Num() < 2) continue;
 
-		const FName* Theirs = Above.Find(Kind.Key);
-
-		int32 Kept = Kind.Value[0];
-
-		for (const int32 Index : Kind.Value) {
-			const UObject* Component = Part->GetObjectPropertyValue(Held.GetRawPtr(Index));
-
-			if (Theirs == nullptr || Component->GetFName() != *Theirs) {
-				Kept = Index;
-
-				break;
-			}
-		}
+		const int32 Kept = Kind.Value[0];
 
 		for (const int32 Index : Kind.Value) {
 			if (Index != Kept) Dropped.Add(Index);
@@ -685,31 +722,9 @@ static void SettleEffectComponents(const UBlueprint* Blueprint) {
 	 *
 	 * An effect remembers which shape its settings were last saved in, and the engine only marks one
 	 * as brought up to date once it has been loaded from disk. One made here has never been loaded, so
-	 * it is saved still saying it is the old shape, and every load after that makes its components out
-	 * of the old settings all over again, beside the ones it already has. */
-	if (const FStructProperty* Version = FindFProperty<FStructProperty>(Class, TEXT("DataVersion"))) {
-		if (FProperty* Current = Version->Struct != nullptr ? Version->Struct->FindPropertyByName(TEXT("CurrentVersion")) : nullptr) {
-			void* At = Current->ContainerPtrToValuePtr<void>(Version->ContainerPtrToValuePtr<void>(Defaults));
-
-			const FEnumProperty* AsEnum = CastField<FEnumProperty>(Current);
-			const UEnum* Versions = AsEnum != nullptr ? AsEnum->GetEnum() : nullptr;
-
-			if (Versions != nullptr && AsEnum->GetUnderlyingProperty() != nullptr) {
-				/* The newest the engine knows, which is the last entry before the one that only counts them */
-				int64 Newest = 0;
-
-				for (int32 Index = 0; Index < Versions->NumEnums(); Index++) {
-					if (Versions->ContainsExistingMax() && Index == Versions->NumEnums() - 1) break;
-
-					Newest = FMath::Max(Newest, Versions->GetValueByIndex(Index));
-				}
-
-				if (AsEnum->GetUnderlyingProperty()->GetSignedIntPropertyValue(At) < Newest) {
-					AsEnum->GetUnderlyingProperty()->SetIntPropertyValue(At, Newest);
-				}
-			}
-		}
-	}
+	 * it would be saved still saying it is the old shape, and every load and every compile after that
+	 * would make its components out of the old settings all over again, beside the ones it has. */
+	if (Shape != nullptr) *Shape = NewestEffectVersion();
 }
 
 bool CompileBlueprintGuarded(UBlueprint* Blueprint, const EBlueprintCompileOptions Options) {
@@ -736,6 +751,16 @@ bool CompileBlueprintGuarded(UBlueprint* Blueprint, const EBlueprintCompileOptio
 	}
 
 	const int32 Depth = SlowTasks();
+
+	/* Before the compile as well as after.
+	 *
+	 * Compiling an effect compiles every effect made from it in the same breath, and each of those
+	 * takes a copy of whatever components its parent holds at that moment, by name. A parent whose
+	 * components were only just made out of its settings holds them under whatever numbered names came
+	 * up, the children copy those in beside the ones they already had under the proper names, and are
+	 * left with two of a kind. Made and named before anything is compiled, there is never a moment a
+	 * child can see anything but the names that stay. */
+	SettleEffectComponents(Blueprint);
 
 	if (Attempt(Blueprint, Options)) {
 		SettleEffectComponents(Blueprint);

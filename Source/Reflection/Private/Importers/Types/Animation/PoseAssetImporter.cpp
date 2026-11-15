@@ -18,6 +18,7 @@
 
 #include "Modules/Cloud/Cloud.h"
 #include "Modules/Cloud/Remote.h"
+#include "Utilities/AssetPaths.h"
 #include "Utilities/JsonHelpers.h"
 #include "Importers/Types/Animation/PreviewMesh.h"
 
@@ -396,9 +397,17 @@ void IPoseAssetImporter::ReverseCookLocalSpacePose(USkeleton* Skeleton) {
 
 	const FString PotentialAnimSequencePath = ParentPath / CleanName;
 
-	/* Taken already, whether or not anything has been written out. */
+	/* Taken already, whether or not anything has been written out.
+	 *
+	 * Or taken in the game itself: "X_PoseAsset" sits beside the mesh it was made for, and that mesh is usually
+	 * called "X". Here or not yet, the name is the mesh's, and an animation saved under it would stop the mesh from
+	 * ever being brought in. */
+	const TSharedPtr<FJsonObject> InTheGame = Cloud::Export::GetRawBlocking(ToCloudPackagePath(PotentialAnimSequencePath));
+
 	if (FPackageName::DoesPackageExist(PotentialAnimSequencePath)
-		|| FindObject<UObject>(nullptr, *(PotentialAnimSequencePath + TEXT(".") + CleanName)) != nullptr) {
+		|| FindObject<UObject>(nullptr, *(PotentialAnimSequencePath + TEXT(".") + CleanName)) != nullptr
+		/* Cloud answers a path it has nothing at with an error object, not with exports */
+		|| (InTheGame.IsValid() && InTheGame->HasField(TEXT("exports")))) {
 		CleanName = GetAssetName() + "_Pose_Export";
 	}
 	
