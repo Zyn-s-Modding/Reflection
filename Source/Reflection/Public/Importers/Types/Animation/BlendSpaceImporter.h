@@ -40,6 +40,15 @@ private:
 
 	/* Puts the grid into the order this engine reads it in.  */
 	void AlignGridToEngine(UReflectionBlendSpace* BlendSpace);
+
+	/* Brings a blend space saved before 5.0 up to date the way the engine's own loader does.
+	 *
+	 * 5.0 picks samples at run time out of a triangulation it keeps beside the grid, and an asset
+	 * written by an older engine has none: loading one from disk, the engine notices the version,
+	 * tells it to keep using the grid, builds the data and keeps the old smoothing. Written out of an
+	 * export instead, none of that runs, the triangulation stays empty, and every sample lookup fails
+	 * at run time, leaving whatever plays it frozen on its first frame in the reference pose. */
+	void UpgradeFromOlderEngine(UReflectionBlendSpace* BlendSpace);
 };
 
 REGISTER_IMPORTER(IBlendSpaceImporter, (TArray<FString>{

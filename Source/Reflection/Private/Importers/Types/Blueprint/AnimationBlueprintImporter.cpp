@@ -463,6 +463,15 @@ bool IAnimationBlueprintImporter::Import() {
 			FString Named;
 
 			if (NodeValue->AsObject()->TryGetStringField(TEXT("Graph"), Named) && !Named.IsEmpty()) {
+				/* The animation graph's own input pose names the animation graph, which is not a layer.
+				 *
+				 * A post process blueprint takes the mesh's pose in through an input pose in its
+				 * animation graph, and the cook writes that graph's name on it like a layer's input.
+				 * Taken as a layer, it is laid out on its own into the animation graph, which is
+				 * emptied first: everything the graph had already been given is thrown away, and the
+				 * blueprint is left with an output pose wired to nothing, which plays the bind pose. */
+				if (Named == UEdGraphSchema_K2::GN_AnimGraph.ToString()) Named = FString();
+
 				Belongs.Add(Key, Named);
 			}
 		}

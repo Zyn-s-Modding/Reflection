@@ -3127,7 +3127,12 @@ UK2Node* FBytecodeGraph::PlaceCall(const FUObjectJsonValueExport& Expression, UE
 		const UClass* Mine = Own != nullptr ? Own->GeneratedClass : nullptr;
 		const UClass* Theirs = Function->GetOwnerClass();
 
-		if (Mine != nullptr && Theirs != nullptr && Mine != Theirs && Mine->IsChildOf(Theirs)) {
+		/* An interface's event that a parent class implements has the interface's function as its parent: calling
+		 * up to it is a final call to the interface's function, and the class is no child of the interface. */
+		const bool bImplementedInterface = Mine != nullptr && Theirs != nullptr
+			&& Theirs->HasAnyClassFlags(CLASS_Interface) && Mine->ImplementsInterface(Theirs);
+
+		if (Mine != nullptr && Theirs != nullptr && Mine != Theirs && (Mine->IsChildOf(Theirs) || bImplementedInterface)) {
 			/* And whether this one has a copy of its own, which makes the call a parent call */
 			const UFunction* Ours = Mine->FindFunctionByName(Function->GetFName());
 
@@ -3502,7 +3507,12 @@ void FBytecodeGraph::Connect(UEdGraphPin* From, UEdGraphPin* To) {
 	 * call is written as a context around it; left empty, it is written as a plain call on the
 	 * blueprint. Both run the same and neither is longer by accident, so the wire stays on a call
 	 * and goes everywhere else. */
-	if (Schema->IsSelfPin(*To) && !To->GetOwningNode()->IsA<UK2Node_CallFunction>()) {
+	/* And except on a variable read against a named class, whose target pin stands for nothing when it is empty: the
+	 * compiler refuses one left unwired, and wired to self it is written as the same context around the read. */
+	const UK2Node_Variable* AsVariable = Cast<UK2Node_Variable>(To->GetOwningNode());
+	const bool bTargetedVariable = AsVariable != nullptr && !AsVariable->VariableReference.IsSelfContext();
+
+	if (Schema->IsSelfPin(*To) && !To->GetOwningNode()->IsA<UK2Node_CallFunction>() && !bTargetedVariable) {
 		if (UK2Node_Self* Itself = Cast<UK2Node_Self>(From->GetOwningNode())) {
 			/* Unless something else is reading it, in which case it is drawn for their sake */
 			if (From->LinkedTo.Num() == 0) Graph->RemoveNode(Itself);
