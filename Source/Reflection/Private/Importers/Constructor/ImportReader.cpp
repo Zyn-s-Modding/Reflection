@@ -158,17 +158,20 @@ bool IImportReader::ReadExportsAndImport(const TArray<TSharedPtr<FJsonValue>>& E
 
 	const bool IsBlueprint = Container->FindByType(FString("BlueprintGeneratedClass"))->IsJsonValid();
 	
+	bool bAnyImportAttempted = false;
 	for (FUObjectExport* Export : InDependencyOrder(Container)) {
 		if (IsBlueprint) {
 			if (Export->GetType() != "BlueprintGeneratedClass") continue;
 		}
 		
-		if (IImporter* Importer = ReadExportAndImport(Container, Export, File, HideNotifications, bUseRelativePath)) OutImporter = Importer;
+		if (IImporter* Importer = ReadExportAndImport(Container, Export, File, HideNotifications, bUseRelativePath, &bAnyImportAttempted)) OutImporter = Importer;
 	}
 
 	/* Nothing matched. Every export gets offered to the reader and most of them are subobjects with
 	 * no importer of their own, so this is only worth saying once the whole package has been walked
 	 * and come to nothing: otherwise the run counts a file it did not import as one it did. */
+	if (OutImporter == nullptr && bAnyImportAttempted) return false;
+
 	if (OutImporter == nullptr) {
 		const FString Name = FPaths::GetBaseFilename(File);
 
@@ -218,7 +221,7 @@ bool IImportReader::ReadExportsAndImport(const TArray<TSharedPtr<FJsonValue>>& E
 	return true;
 }
 
-IImporter* IImportReader::ReadExportAndImport(FUObjectExportContainer* Container, FUObjectExport* Export, FString File, const bool HideNotifications, bool bUseRelativePath) {
+IImporter* IImportReader::ReadExportAndImport(FUObjectExportContainer* Container, FUObjectExport* Export, FString File, const bool HideNotifications, bool bUseRelativePath, bool* bImportAttempted) {
 	const FString Type = Export->GetType().ToString();
 	FString Name = Export->GetName().ToString();
 
@@ -380,6 +383,7 @@ IImporter* IImportReader::ReadExportAndImport(FUObjectExportContainer* Container
 
 	Export->Package = LocalPackage;
 	Importer->Initialize(Export, Container);
+	if (bImportAttempted != nullptr) *bImportAttempted = true;
 
 	/* Everything the import reports from here on belongs to this asset, including its references */
 	const FImportIssueScope IssueScope(Name, LocalPackage->GetName(), Type);
