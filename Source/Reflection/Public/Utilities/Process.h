@@ -4,6 +4,11 @@
 
 #include "HAL/PlatformProcess.h"
 
+#if PLATFORM_MAC
+#include <libproc.h>
+#include <sys/proc_info.h>
+#endif
+
 /* TlHelp32 brings the platform's own types in, which the engine keeps behind its own names. Taken
  * in raw it collides with whatever includes WindowsPlatformProcess.h afterwards, and which file
  * that is depends on how the unity blob was put together. */
@@ -80,7 +85,36 @@ inline bool IsProcessRunning(const FString& ProcessName) {
 
 	return IsRunning;
 #elif PLATFORM_MAC
-	return FPlatformProcess::IsApplicationRunning(*ProcessName);
+	/* Windows names are spelled with .exe, but a Mac process (Mirror.app/Contents/MacOS/Mirror)
+	 * carries no suffix, so asking by the Windows name never finds it. */
+	FString Name = ProcessName;
+	if (Name.EndsWith(TEXT(".exe"), ESearchCase::IgnoreCase)) {
+		Name.LeftChopInline(4);
+	}
+
+	const int32 BufferSize = proc_listpids(PROC_ALL_PIDS, 0, nullptr, 0);
+	if (BufferSize <= 0) {
+		return FPlatformProcess::IsApplicationRunning(*Name);
+	}
+
+	TArray<pid_t> PIDs;
+	PIDs.SetNumUninitialized(BufferSize / sizeof(pid_t) + 16);
+
+	const int32 BytesWritten = proc_listpids(PROC_ALL_PIDS, 0, PIDs.GetData(), PIDs.Num() * sizeof(pid_t));
+	const int32 Count = FMath::Min(BytesWritten / (int32)sizeof(pid_t), PIDs.Num());
+
+	for (int32 Index = 0; Index < Count; Index++) {
+		if (PIDs[Index] == 0) {
+			continue;
+		}
+
+		char Buffer[PROC_PIDPATHINFO_MAXSIZE];
+		if (proc_name(PIDs[Index], Buffer, sizeof(Buffer)) > 0 && Name.Equals(UTF8_TO_TCHAR(Buffer), ESearchCase::IgnoreCase)) {
+			return true;
+		}
+	}
+
+	return false;
 #else
 	/* @LINUX.PROCESSES */
 	return true;

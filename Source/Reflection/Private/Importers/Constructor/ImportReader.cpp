@@ -355,6 +355,10 @@ IImporter* IImportReader::ReadExportAndImport(FUObjectExportContainer* Container
 	if (LocalPackage == nullptr) {
 		FImportIssues::ReportFor(Name, FString(), Type, EImportIssue::Failed, TEXT("Couldn't create a package for this asset"), FailureReason);
 
+		/* It was an importer that was found and a package that was not. Left unmarked the caller
+		 * takes this for no importer existing and adds a Missing Class on top of the real reason. */
+		if (bImportAttempted != nullptr) *bImportAttempted = true;
+
 		return nullptr;
 	}
 

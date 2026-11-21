@@ -24,6 +24,19 @@
 #include "Modules/Cloud/Cloud.h"
 #include "Settings/Runtime.h"
 
+/* Takes the export directory off the front of a path, where the path has it.
+ *
+ * With no export directory known (it is read from FModel's settings, which only exist on
+ * Windows), the separator being split on was a lone "/", which matched the first slash of
+ * whatever was there and ate the leading one off a /Game/ path. */
+static void StripExportDirectory(FString& Path) {
+	const FString& Directory = GReflectionRuntime.ExportDirectory.Path;
+
+	if (Directory.IsEmpty()) return;
+
+	Path.Split(Directory + "/", nullptr, &Path, ESearchCase::IgnoreCase, ESearchDir::FromStart);
+}
+
 /* CreateAssetPackage Implementations ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 UPackage* FAssetUtilities::CreateAssetPackage(const FString& Path) {
 	/* A path off disk rather than a package path gets this far when the export was reflected from
@@ -69,13 +82,13 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString
 	if (!ModifiablePath.StartsWith("/Game/") && !ModifiablePath.StartsWith("/Plugins/") && ModifiablePath.Contains("/Content/")) {
 		if (!ProjectName.IsEmpty()) {
 			ModifiablePath = ModifiablePath.Replace(*(ProjectName + "/Content"), TEXT("/Game"));
-			ModifiablePath.Split(*(GReflectionRuntime.ExportDirectory.Path + "/"), nullptr, &ModifiablePath, ESearchCase::IgnoreCase, ESearchDir::FromStart);
+			StripExportDirectory(ModifiablePath);
 			ModifiablePath.Split("/", &ModifiablePath, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
 			ModifiablePath += "/";
 		}
 
 		if (!ModifiablePath.StartsWith("/Game/") && !ModifiablePath.StartsWith("/Plugins/") && ModifiablePath.Contains("/Content/")) {
-			ModifiablePath.Split(*(GReflectionRuntime.ExportDirectory.Path + "/"), nullptr, &ModifiablePath, ESearchCase::IgnoreCase, ESearchDir::FromStart);
+			StripExportDirectory(ModifiablePath);
 			ModifiablePath.Split("/", nullptr, &ModifiablePath, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 			ModifiablePath.Split("/", &ModifiablePath, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
 			/* Ex: RestPath: Plugins/Folder/BaseTextures */
