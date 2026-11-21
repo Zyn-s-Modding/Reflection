@@ -118,6 +118,14 @@ namespace {
 	}
 
 #if UE5_4_BEYOND
+	/* SetupValidMetadata is protected on some engines and public on others, and a derived type
+	 * naming it through a member pointer is allowed to reach it on both. */
+	struct FRigMetadataAccess : FRigBaseElement {
+		static FRigBaseMetadata* Setup(FRigBaseElement* Element, const FName& Name, ERigMetadataType Type) {
+			return (Element->*(&FRigMetadataAccess::SetupValidMetadata))(Name, Type);
+		}
+	};
+
 	void RestoreHierarchyMetadata(URigHierarchy* Hierarchy, UPropertySerializer* Serializer,
 		const FUObjectJsonValueExport& Export) {
 		if (!Export.Has(TEXT("LoadedElementMetadata"))) return;
@@ -143,7 +151,7 @@ namespace {
 					continue;
 				}
 
-				FRigBaseMetadata* Metadata = Element->SetupValidMetadata(FName(*Pair.Key), static_cast<ERigMetadataType>(Number));
+				FRigBaseMetadata* Metadata = FRigMetadataAccess::Setup(Element, FName(*Pair.Key), static_cast<ERigMetadataType>(Number));
 				UScriptStruct* Struct = Metadata != nullptr ? Metadata->GetMetadataStruct() : nullptr;
 				FProperty* Property = Struct != nullptr ? Struct->FindPropertyByName(TEXT("Value")) : nullptr;
 				if (Property == nullptr) {
@@ -461,9 +469,14 @@ int32 IControlRigImporter::ConstructHierarchy(UControlRigBlueprint* Blueprint) c
 				if (Fields.JsonObject.IsValid()) {
 					GetPropertySerializer()->DeserializeStruct(FRigConnectorSettings::StaticStruct(), Fields.JsonObject.ToSharedRef(), &Settings);
 				}
+#if UE5_4_API
 				return Controller->AddConnector(Description.Key.Name, Settings, false, false).IsValid();
+#else
+				return Controller->AddConnector(Description.Key.Name, Transform, true, Settings, false, false).IsValid();
+#endif
 			}
 
+#if UE5_4_API
 			case ERigElementType::Socket: {
 				FLinearColor Color = FLinearColor::White;
 				const FUObjectJsonValueExport Fields = Description.Json.GetObject(TEXT("Color"));
@@ -474,6 +487,7 @@ int32 IControlRigImporter::ConstructHierarchy(UControlRigBlueprint* Blueprint) c
 				Description.Json.JsonObject->TryGetStringField(TEXT("Description"), DescriptionText);
 				return Controller->AddSocket(Description.Key.Name, Description.Parent, Transform, false, Color, DescriptionText, false, false).IsValid();
 			}
+#endif
 #endif
 
 			default: {

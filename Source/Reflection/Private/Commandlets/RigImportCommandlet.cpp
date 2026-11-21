@@ -1118,7 +1118,7 @@ static void ReportExpressionSyntax() {
 
 /* 5.4 gathered these behind one handle. Before it the map is asked for directly, and the
  * constants behind it are the asset's own with nothing outside able to count them. */
-#if UE5_4_BEYOND
+#if UE5_4_API
 	const TSharedPtr<const FExpressionData> Data = Asset->GetCompiledExpressionData();
 	const TMap<FName, CurveExpression::Evaluator::FExpressionObject>* Parsed = Data.IsValid() ? &Data->ExpressionMap : nullptr;
 	const int32 Constants = Data.IsValid() ? Data->NamedConstants.Num() : 0;
@@ -1363,7 +1363,7 @@ int32 URigImportCommandlet::Main(const FString& Params) {
 		}
 
 /* 5.4 gathered these behind one handle, and only it carries the named constants */
-#if UE5_4_BEYOND
+#if UE5_4_API
 		const TSharedPtr<const FExpressionData> Data = Expressions->GetCompiledExpressionData();
 
 		UE_LOG(LogRigImportTest, Display, TEXT("source lines: %d, compiled expressions: %d, named constants: %d"),

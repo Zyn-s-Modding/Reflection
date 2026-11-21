@@ -96,10 +96,10 @@ inline EObjectFlags ParseObjectFlags(const FString& FlagsString) {
 #endif
 #if ENGINE_UE5
 	/* RF_HasPlaceholderType arrived in 5.4 and was removed in 5.8; RF_MirroredGarbage is 5.4+ */
-#if ENGINE_MINOR_VERSION > 3 && ENGINE_MINOR_VERSION < 8
+#if UE5_4_API && ENGINE_MINOR_VERSION < 8
 		{ TEXT("RF_HasPlaceholderType"), RF_HasPlaceholderType },
 #endif
-#if ENGINE_MINOR_VERSION > 3
+#if UE5_4_API
 		{ TEXT("RF_MirroredGarbage"), RF_MirroredGarbage },
 #endif
 	/* RF_AllocatedInSharedPage was deprecated in 5.8; its bit was reassigned to RF_HasDynamicImports */

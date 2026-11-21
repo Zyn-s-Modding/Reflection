@@ -17,6 +17,14 @@ public class Reflection : ModuleRules {
 
 		PublicDefinitions.Add("REFLECTION_CLOUD_SERVER=" + (bCloudServer ? "1" : "0"));
 
+		/* Fortnite release branches report 5.4 but are cut before the 5.4 engine API landed (no
+		 * EAllowShrinking, RF_MirroredGarbage, GetCompiledExpressionData, ...), so the version
+		 * number alone can't be trusted for 5.4 features there. */
+		var bPre54Api = Target.Version.MajorVersion == 5 && Target.Version.MinorVersion == 4
+			&& Target.Version.BranchName.Contains("Fortnite");
+
+		PublicDefinitions.Add("REFLECTION_PRE_5_4_API=" + (bPre54Api ? "1" : "0"));
+
 		/* Control Rig ships as an engine plugin, and an engine it was stripped out of has nothing to
 		 * link the rig importer against. The rig API this is written against is the UE5 one, so 4.26
 		 * and 4.27, where the plugin exists but a rig is still a hierarchy container, count as not

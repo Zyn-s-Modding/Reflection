@@ -111,7 +111,7 @@ int32 TMeshGeometry::RebuildLodModels(USkeletalMesh* SkeletalMesh, const TShared
 		 * goes through it. Deserialized properties can fill in the infos alone, so the shorter of
 		 * the two is what decides; AddLODInfo is the only thing that grows either. */
 		while (SkeletalMesh->GetLODNum() <= LodIndex
-#if UE5_4_BEYOND
+#if UE5_4_API
 			|| SkeletalMesh->GetNumSourceModels() <= LodIndex
 #endif
 			) {

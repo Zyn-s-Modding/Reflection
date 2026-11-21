@@ -236,7 +236,7 @@ int32 ISkeletalMeshImporter::BuildMorphTargets(USkeletalMesh* SkeletalMesh, cons
 
 	for (int32 LodIndex = 0; LodIndex < ImportedModel->LODModels.Num(); ++LodIndex) {
 		/* 5.4 renamed the question. Before it, the same thing is asked of the imported data. */
-#if UE5_4_BEYOND
+#if UE5_4_API
 		if (!SkeletalMesh->HasMeshDescription(LodIndex)) continue;
 #else
 		if (IsMeshLodImportedDataEmpty(SkeletalMesh, LodIndex)) continue;

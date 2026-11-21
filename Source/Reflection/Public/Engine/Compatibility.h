@@ -73,6 +73,16 @@
 	#define UE5_4_BEYOND 0
 #endif
 
+/* UE5_4_BEYOND says the engine reports 5.4 or later. Fortnite release branches report 5.4 but are
+ * cut before part of the 5.4 API landed (EAllowShrinking, GetCompiledExpressionData, rig sockets,
+ * ...), so code that needs those exact APIs asks UE5_4_API instead. The build file sets
+ * REFLECTION_PRE_5_4_API for those branches. */
+#if UE5_4_BEYOND && !(defined(REFLECTION_PRE_5_4_API) && REFLECTION_PRE_5_4_API)
+	#define UE5_4_API 1
+#else
+	#define UE5_4_API 0
+#endif
+
 #if ENGINE_UE5 && ENGINE_MINOR_VERSION >= 1
 	#define UE5_1_BEYOND 1
 #else

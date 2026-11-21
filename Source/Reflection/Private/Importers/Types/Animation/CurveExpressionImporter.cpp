@@ -169,7 +169,7 @@ bool ICurveExpressionImporter::Import() {
 
 		/* 5.4 gathered the compiled expressions behind one handle; before it the map is asked
 		 * for directly */
-#if UE5_4_BEYOND
+#if UE5_4_API
 		if (const TSharedPtr<const FExpressionData> Data = Asset->GetCompiledExpressionData()) {
 			for (const FName& Target : Targets) {
 				if (!Data->ExpressionMap.Contains(Target)) Rejected.Add(Target);

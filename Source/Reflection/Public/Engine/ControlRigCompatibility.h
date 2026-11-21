@@ -134,7 +134,7 @@ inline UFactory* RigBlueprintFactory(UClass* ParentClass) {
 inline URigHierarchy* RigHierarchyOf(UControlRigBlueprint* Blueprint) {
 	if (Blueprint == nullptr) return nullptr;
 
-#if UE5_4_BEYOND
+#if UE5_4_API
 	return Blueprint->GetHierarchy();
 #else
 	return Blueprint->Hierarchy;

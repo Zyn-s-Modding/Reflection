@@ -52,7 +52,7 @@ namespace {
 		for (const FRigVMTemplateArgumentInfo& Info : Factory->GetArgumentInfos(ReadLock)) {
 			Built.Add({ Info.Name, Info.Direction });
 		}
-#elif UE5_4_BEYOND
+#elif UE5_4_API
 		for (const FRigVMTemplateArgumentInfo& Info : Factory->GetArgumentInfos()) {
 			Built.Add({ Info.Name, Info.Direction });
 		}

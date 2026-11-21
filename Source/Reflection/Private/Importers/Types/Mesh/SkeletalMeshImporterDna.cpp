@@ -259,7 +259,7 @@ bool ISkeletalMeshImporter::ApplyDna(USkeletalMesh* SkeletalMesh, const FString&
 
 		if (Start > 0) {
 			/* 5.4 spells the shrink choice as an enum; before it the flag is a plain bool */
-#if UE5_4_BEYOND
+#if UE5_4_API
 			Cooked.RemoveAt(0, Start, EAllowShrinking::No);
 #else
 			Cooked.RemoveAt(0, Start, false);
