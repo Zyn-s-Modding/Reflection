@@ -22,6 +22,8 @@
 #include "Importers/Constructor/Asset.h"
 #include "Engine/Package.h"
 #include "Utilities/AssetPaths.h"
+#include "Settings/Blacklist.h"
+#include "Engine/Log.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 
@@ -177,6 +179,14 @@ TObjectPtr<T> IImporter::DownloadWrapper(TObjectPtr<T> InObject, FString Type, c
              * is what is asked for. Where it lands is this project's business. */
             const FString Asked = FSoftObjectPath(Type + "'" + NewPath + "." + Name + "'").ToString();
             const FString Where = Lands.IsEmpty() ? Asked : FSoftObjectPath(Type + "'" + Lands + "'").ToString();
+
+            /* Kept out on purpose. Whatever the project already has is still what is handed back,
+             * only nothing new is fetched, so this says nothing about it being unresolved. */
+            if (FRBlacklist::IsBlacklisted(Type, Asked) || FRBlacklist::IsPathBlacklisted(Where)) {
+                UE_LOG(LogReflection, Log, TEXT("Blacklisted reference \"%s\" left to what the project has"), *Asked);
+
+                return InObject;
+            }
 
             /* And never over one the project already has: a curve inside a blueprint is named through its class, which is not where the loader looks */
             /* Nor one compiled into the build, which is here or nowhere whatever is fetched */

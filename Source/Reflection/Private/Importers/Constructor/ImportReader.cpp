@@ -18,6 +18,7 @@
 #include "Modules/Cloud/Remote.h"
 #include "UObject/UObjectHash.h"
 #include "Settings/SettingsAccess.h"
+#include "Settings/Blacklist.h"
 
 #if REFLECTION_RIGVM
 #include "Engine/ControlRigCompatibility.h"
@@ -195,6 +196,16 @@ bool IImportReader::ReadExportsAndImport(const TArray<TSharedPtr<FJsonValue>>& E
 			if (Type.IsEmpty()) Type = ExportType;
 		}
 
+		/* Turned away by the blacklist, which is a setting and not a missing importer */
+		FString Blacklisted;
+
+		if (FRBlacklist::IsBlacklisted(Type, File, Name, nullptr, &Blacklisted)) {
+			FImportIssues::ReportFor(Name, File, Type, EImportIssue::Setting, TEXT("Blacklisted"),
+				Blacklisted + TEXT(". Take it off the blacklist in the settings to reflect it."));
+
+			return false;
+		}
+
 		/* An importer switched off rather than absent. It reads the same from here and is not the
 		 * same thing at all, so it is worth saying which of the two happened. */
 		if (ImportTypes::Experimental.Contains(Type) && !GetSettings()->EnableExperiments) {
@@ -309,6 +320,17 @@ IImporter* IImportReader::ReadExportAndImport(FUObjectExportContainer* Container
 	const FImporterFactoryDelegate* AncestorFactory = !Importable && IsMainAsset ? FindFactoryForClassAncestor(Class) : nullptr;
 
 	if (!Importable && AncestorFactory == nullptr) return nullptr;
+
+	/* Turned away before the package is made, since it is made whether the importer wants it or not
+	 * and an empty one left behind shows as a folder. Asked of what would actually be built, so a
+	 * part nothing imports on its own is never named as skipped. */
+	FString Blacklisted;
+
+	if (FRBlacklist::IsBlacklisted(Type, File, Name, Class, &Blacklisted)) {
+		UE_LOG(LogReflection, Log, TEXT("Not reflecting \"%s\" (%s): %s"), *Name, *Type, *Blacklisted);
+
+		return nullptr;
+	}
 
 	if (bUseRelativePath) {
 		/* Convert from relative path to full path */

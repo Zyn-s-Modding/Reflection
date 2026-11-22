@@ -14,6 +14,7 @@
 #include "Modules/Toolbar/Tools/ImportFolder.h"
 #include "Modules/UI/Reflect/SReflectPathsDialog.h"
 #include "Engine/EngineUtilities.h"
+#include "Settings/Blacklist.h"
 
 void TToolImportFromPath::Execute() {
 	/* Nothing is asked of Cloud to put a list together, so it is not asked for until Reflect is */
@@ -115,6 +116,37 @@ bool TToolImportFromPath::Import(const FString& InPath, const TSet<FString>& All
 		);
 	};
 
+	/* Turned away by the blacklist. A folder run counts it with what its own filter let past, since
+	 * both are things somebody asked to be left out. Asked for by name, it is worth saying why
+	 * nothing came of it. */
+	const auto TurnAway = [&](const FString& Type, const FString& Reason) {
+		UE_LOG(LogReflection, Log, TEXT("Not reflecting \"%s\": %s"), *PackagePath, *Reason);
+
+		if (bOutFiltered != nullptr) {
+			*bOutFiltered = true;
+
+			return;
+		}
+
+		FImportIssues::ReportFor(
+			AssetName.IsEmpty() ? PackagePath : AssetName,
+			PackagePath,
+			Type,
+			EImportIssue::Setting,
+			TEXT("Blacklisted"),
+			Reason + TEXT(". Take it off the blacklist in the settings to reflect it.")
+		);
+	};
+
+	/* Before anything is fetched, since a path is all a folder or an asset entry needs */
+	FString Blacklisted;
+
+	if (FRBlacklist::IsPathBlacklisted(PackagePath, AssetName, &Blacklisted)) {
+		TurnAway(FString(), Blacklisted);
+
+		return false;
+	}
+
 	/* Reached straight off a menu click, so nothing here has a continuation to hand a callback to.
 	 * The scope is what keeps the editor drawn and cancellable while the requests run. */
 	const FBlockingRequestScope BlockingScope(FText::Format(
@@ -141,6 +173,12 @@ bool TToolImportFromPath::Import(const FString& InPath, const TSet<FString>& All
 	FString Type;
 	if (!Export.IsValid() || !Export->TryGetStringField(TEXT("Type"), Type)) {
 		ReportUnreachable(EImportIssue::Data, TEXT("Cloud returned an export with no type"));
+
+		return false;
+	}
+
+	if (FRBlacklist::IsTypeBlacklisted(Type, nullptr, &Blacklisted)) {
+		TurnAway(Type, Blacklisted);
 
 		return false;
 	}

@@ -23,6 +23,7 @@
 #include "Importers/Constructor/ImportReader.h"
 #include "Modules/Cloud/Cloud.h"
 #include "Settings/Runtime.h"
+#include "Settings/Blacklist.h"
 
 /* Takes the export directory off the front of a path, where the path has it.
  *
@@ -276,6 +277,17 @@ namespace {
 template <typename T>
 bool FAssetUtilities::ConstructAsset(const FString& Path, const FString& RealPath, const FString& Type, TObjectPtr<T>& OutObject, bool& bSuccess) {
 	if (Type.IsEmpty()) {
+		return false;
+	}
+
+	/* Turned away before anything is asked of Cloud. Checked against where the game keeps it and
+	 * where it lands here, since an entry can be written against either. Asked before the skeleton
+	 * exception below: a skeleton somebody blacklisted is one they meant to keep out. */
+	FString Blacklisted;
+
+	if (FRBlacklist::IsBlacklisted(Type, Path, FString(), nullptr, &Blacklisted) || FRBlacklist::IsPathBlacklisted(RealPath, FString(), &Blacklisted)) {
+		UE_LOG(LogReflection, Log, TEXT("Not reflecting \"%s\": %s"), *Path, *Blacklisted);
+
 		return false;
 	}
 

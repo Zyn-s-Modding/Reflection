@@ -10,6 +10,7 @@
 #include "Types/LevelSettings.h"
 #include "Types/MeshSettings.h"
 #include "Types/TextureSettings.h"
+#include "Types/BlacklistSettings.h"
 #include "Redirector.h"
 
 #include "ReflectionSettings.generated.h"
@@ -93,6 +94,11 @@ public:
 
 	UPROPERTY(EditAnywhere, Config, Category = Settings)
 	FRSettings AssetSettings;
+
+	/* What is never reflected: whole types, single assets, or everything in a folder. Asked of
+	 * everything reflected, references included. */
+	UPROPERTY(EditAnywhere, Config, Category = Blacklist, meta = (ShowOnlyInnerProperties))
+	FRBlacklistSettings Blacklist;
 
 	/* Reading a level, which is experimental: what it places and what it leaves alone */
 	UPROPERTY(EditAnywhere, DisplayName = "Level", Config, Category = Settings, meta = (EditCondition = "EnableExperiments"))
