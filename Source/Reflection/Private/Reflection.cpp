@@ -18,6 +18,7 @@
 #include "Modules/UI/SupportedAssets/SupportedAssetsTab.h"
 #include "Modules/UI/Validation/ValidationTab.h"
 #include "Modules/Toolbar/Toolbar.h"
+#include "Modules/UI/Settings/BlacklistCustomization.h"
 #include "Engine/EngineUtilities.h"
 
 #include "Logging/LogVerbosity.h"
@@ -45,6 +46,9 @@ void FReflectionModule::StartupModule() {
 
 	/* Register tabs, the style has to exist first for their icons */
 	FSupportedAssetsTab::Register();
+
+	/* How the blacklist's types and folders are drawn on the settings page */
+	FRBlacklistCustomization::Register();
 
 #if ENGINE_UE5
 	FValidationTab::Register();
@@ -90,6 +94,7 @@ void FReflectionModule::ShutdownModule() {
 #endif
 
 	FSupportedAssetsTab::Unregister();
+	FRBlacklistCustomization::Unregister();
 
 #if ENGINE_UE5
 	/* The main menu bar entry is owned by the toolbar, not the module */

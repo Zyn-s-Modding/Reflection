@@ -5,6 +5,41 @@
 #include "CoreMinimal.h"
 #include "BlacklistSettings.generated.h"
 
+/* One type on the blacklist.
+ *
+ * A struct of its own rather than a bare string so the settings page can draw it as a picker: every
+ * kind of asset the editor knows of, every type Reflection imports, and every data asset class, with
+ * room to type one none of those name. */
+USTRUCT()
+struct FRBlacklistType {
+	GENERATED_BODY()
+public:
+	FRBlacklistType() = default;
+	FRBlacklistType(const FString& InType) : Type(InType) {}
+
+	/* The type, named as the game names it (not case-sensitive). Example: "Texture2D" */
+	UPROPERTY(EditAnywhere, Config, Category = Blacklist)
+	FString Type;
+};
+
+/* One folder on the blacklist.
+ *
+ * Drawn as a path box with a folder picker beside it. The picker only knows the folders this project
+ * already has, and the box takes any path at all, so a game folder nothing has been reflected into
+ * yet can still be written in. */
+USTRUCT()
+struct FRBlacklistFolder {
+	GENERATED_BODY()
+public:
+	FRBlacklistFolder() = default;
+	FRBlacklistFolder(const FString& InPath) : Path(InPath) {}
+
+	/* The folder, down through every folder beneath it (not case-sensitive).
+	 * Examples: "/Game/Athena/Sounds/", "FortniteGame/Content/Environments/" */
+	UPROPERTY(EditAnywhere, Config, Category = Blacklist)
+	FString Path;
+};
+
 /* What is never reflected, however it is reached.
  *
  * Asked of everything: an asset reflected by path, every asset in a folder run, a local json, and
@@ -20,11 +55,9 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category = Blacklist)
 	bool Enabled = true;
 
-	/* Types that are never reflected, named as the game names them (not case-sensitive).
-	 *
-	 * Examples: "Texture2D", "SoundWave", "AnimSequence", "BlueprintGeneratedClass" */
-	UPROPERTY(EditAnywhere, DisplayName = "Asset Types", Config, Category = Blacklist)
-	TArray<FString> Types;
+	/* Types that are never reflected. Pick one from the list, or type a name it doesn't have. */
+	UPROPERTY(EditAnywhere, DisplayName = "Asset Types", Config, Category = Blacklist, meta = (TitleProperty = "Type"))
+	TArray<FRBlacklistType> Types;
 
 	/* A type also covers every type made from it: "Texture" takes Texture2D and TextureCube with it,
 	 * and "Blueprint" takes BlueprintGeneratedClass. Only reaches types this engine has a class for. */
@@ -42,12 +75,9 @@ public:
 	UPROPERTY(EditAnywhere, DisplayName = "Assets", Config, Category = Blacklist)
 	TArray<FString> Assets;
 
-	/* Folders whose contents are never reflected, down through every folder beneath them
-	 * (not case-sensitive).
-	 *
-	 * Either side of a redirect can be given, and the game's own spelling works as well.
-	 *
-	 * Examples: "/Game/Athena/Sounds/", "FortniteGame/Content/Environments/" */
-	UPROPERTY(EditAnywhere, DisplayName = "Folders", Config, Category = Blacklist)
-	TArray<FString> Folders;
+	/* Folders whose contents are never reflected. Pick one this project has, or type any path,
+	 * including a game folder that hasn't been reflected into yet. Either side of a redirect can be
+	 * given, and the game's own spelling works as well. */
+	UPROPERTY(EditAnywhere, DisplayName = "Folders", Config, Category = Blacklist, meta = (TitleProperty = "Path"))
+	TArray<FRBlacklistFolder> Folders;
 };

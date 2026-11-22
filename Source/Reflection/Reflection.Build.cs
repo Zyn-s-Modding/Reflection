@@ -263,6 +263,12 @@ public class Reflection : ModuleRules {
 #endif
 		});
 		
+#if UE_5_2_OR_LATER
+		/* UAssetDefinitionRegistry, which names every kind of asset the editor knows of. The
+		 * blacklist's type picker lists them; before 5.2 the asset tools' own list stands in. */
+		PrivateDependencyModuleNames.Add("AssetDefinition");
+#endif
+
 		/* Where the rig importer is not built, these are still what a graph is drawn with */
 		if (bRigVM && !bControlRig) {
 			PrivateDependencyModuleNames.AddRange(new[] {

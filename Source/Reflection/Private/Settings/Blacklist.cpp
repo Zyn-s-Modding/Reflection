@@ -120,7 +120,8 @@ namespace {
 
 		const FString InFolder = Package + TEXT("/");
 
-		for (const FString& Entry : Blacklist.Folders) {
+		for (const FRBlacklistFolder& Listed : Blacklist.Folders) {
+			const FString& Entry = Listed.Path;
 			FString Folder = Normalize(Entry);
 
 			if (Folder.IsEmpty() || Folder == TEXT("/")) continue;
@@ -175,8 +176,8 @@ bool FRBlacklist::IsTypeBlacklisted(const FString& InType, const UClass* Class, 
 
 	bool bLookedUp = Class != nullptr;
 
-	for (const FString& Entry : Blacklist->Types) {
-		const FString Blocked = TypeName(Entry);
+	for (const FRBlacklistType& Entry : Blacklist->Types) {
+		const FString Blocked = TypeName(Entry.Type);
 
 		if (Blocked.IsEmpty()) continue;
 
