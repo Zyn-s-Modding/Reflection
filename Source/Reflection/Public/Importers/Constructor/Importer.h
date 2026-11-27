@@ -35,11 +35,24 @@
 
 /* The file a package name lands on, if any. */
 inline bool PackageFileOf(const FString& LongPackageName, FString& OutFilename) {
+	if (!FPackageName::IsValidLongPackageName(LongPackageName, /*bIncludeReadOnlyRoots=*/false)) return false;
+
+	/* Asked already this run and found to be nowhere */
+	if (FAssetUtilities::IsKnownMissing(LongPackageName)) return false;
+
 #if ENGINE_UE5
-	return FPackageName::DoesPackageExist(LongPackageName, &OutFilename);
+	const bool bExists = FPackageName::DoesPackageExist(LongPackageName, &OutFilename);
 #else
-	return FPackageName::DoesPackageExist(LongPackageName, nullptr, &OutFilename);
+	const bool bExists = FPackageName::DoesPackageExist(LongPackageName, nullptr, &OutFilename);
 #endif
+
+	/* Only a package with nothing in memory either is missing. One this run created and has
+	 * not written yet is on its way to disk. */
+	if (!bExists && FindPackage(nullptr, *LongPackageName) == nullptr) {
+		FAssetUtilities::RememberMissing(LongPackageName);
+	}
+
+	return bExists;
 }
 
 /* Whether the project has the asset, rather than merely a file where it would be.
@@ -49,10 +62,16 @@ inline bool PackageFileOf(const FString& LongPackageName, FString& OutFilename) 
 inline bool PackageHoldsAsset(const FString& LongPackageName) {
 	FString Held;
 
-	if (!PackageFileOf(LongPackageName, Held)) return false;
+	/* What is in memory is the newest word on it, and an import that just failed is in memory.
+	 * Asked before the disk, since saves are written at the end of a run and an asset this run
+	 * built is in memory well before its file is. */
+	const UPackage* Standing = FPackageName::IsValidLongPackageName(LongPackageName, /*bIncludeReadOnlyRoots=*/false)
+		? FindPackage(nullptr, *LongPackageName)
+		: nullptr;
 
-	/* What is in memory is the newest word on it, and an import that just failed is in memory */
-	if (const UPackage* Standing = FindPackage(nullptr, *LongPackageName)) {
+	if (Standing == nullptr && !PackageFileOf(LongPackageName, Held)) return false;
+
+	if (Standing != nullptr) {
 		TArray<UObject*> Inside;
 		GetObjectsWithOuter(Standing, Inside, false);
 
@@ -132,7 +151,9 @@ public:
     void Save() const;
 
     /* Handle edit changes, and add it to the content browser */
-    bool OnAssetCreation(UObject* Asset) const;
+    /* bFinishedLater: the importer goes on filling the asset in and calls PostEditChange and Save
+     * itself at the end, so neither is done here as well */
+    bool OnAssetCreation(UObject* Asset, bool bFinishedLater = false) const;
     
     /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Object Serializer and Property Serializer ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 public:
@@ -151,7 +172,7 @@ TObjectPtr<T> IImporter::DownloadWrapper(TObjectPtr<T> InObject, FString Type, c
         InObject == nullptr ||
             (Settings->AssetSettings.Texture.ReflectExistingTextures && Type == "Texture2D")
         )
-        && !Path.StartsWith("Engine/") && !Path.StartsWith("/Engine/")
+        && (Settings->AssetSettings.bRedirectEngineContent || (!Path.StartsWith("Engine/") && !Path.StartsWith("/Engine/")))
     ) {
         const UObject* DefaultObject = GetClassDefaultObject(T::StaticClass());
 
@@ -178,7 +199,10 @@ TObjectPtr<T> IImporter::DownloadWrapper(TObjectPtr<T> InObject, FString Type, c
              * Only the game has the thing, and it has it under the name the game gave it, so that
              * is what is asked for. Where it lands is this project's business. */
             const FString Asked = FSoftObjectPath(Type + "'" + NewPath + "." + Name + "'").ToString();
-            const FString Where = Lands.IsEmpty() ? Asked : FSoftObjectPath(Type + "'" + Lands + "'").ToString();
+            const FString Landing = Lands.IsEmpty() ? Asked : FSoftObjectPath(Type + "'" + Lands + "'").ToString();
+            FString Destination;
+            const bool bRedirectedEngineContent = FAssetUtilities::TryGetEngineContentDestination(Landing, Destination);
+            const FString& Where = bRedirectedEngineContent ? Destination : Landing;
 
             /* Kept out on purpose. Whatever the project already has is still what is handed back,
              * only nothing new is fetched, so this says nothing about it being unresolved. */
@@ -186,6 +210,10 @@ TObjectPtr<T> IImporter::DownloadWrapper(TObjectPtr<T> InObject, FString Type, c
                 UE_LOG(LogReflection, Log, TEXT("Blacklisted reference \"%s\" left to what the project has"), *Asked);
 
                 return InObject;
+            }
+
+            if (InObject == nullptr && bRedirectedEngineContent) {
+                if (T* ProjectAsset = LoadObjectByPath<T>(Where)) return ProjectAsset;
             }
 
             /* And never over one the project already has: a curve inside a blueprint is named through its class, which is not where the loader looks */
@@ -202,7 +230,7 @@ TObjectPtr<T> IImporter::DownloadWrapper(TObjectPtr<T> InObject, FString Type, c
                 return InObject;
             }
 
-            if (FAssetUtilities::ConstructAsset(Asked, Where, Type, InObject, DownloadStatus) && DownloadStatus) {
+            if (FAssetUtilities::ConstructAsset(Asked, Landing, Type, InObject, DownloadStatus) && DownloadStatus) {
                 AppendNotification(
                     FText::FromString(Name),
                     FText::FromString(Type),
@@ -262,7 +290,15 @@ void IImporter::LoadExport(const TSharedPtr<FJsonObject>* PackageIndex, TObjectP
 		Chain.Split(".", nullptr, &Outer, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
 	}
 
-	ObjectPath = ToEditorPackagePath(ObjectPath);
+	ObjectPath = ToEditorPackagePathDirect(ObjectPath);
+	const UReflectionSettings* Settings = GetSettings();
+	const bool bSplitTexture = FTextureTypes::IsSupported(ObjectType) && Settings->AssetSettings.PackagedAssets == ERPackagedAssets::Separate;
+	FString SplitPackage;
+	if (Settings->bRedirectOnlyMissingAssets && FPackageName::GetShortName(ObjectPath) != ObjectName) {
+		if (bSplitTexture) SplitPackage = ObjectPath + TEXT("_Texture");
+		else if (!bWithin) SplitPackage = FPackageName::GetLongPackagePath(ObjectPath) / ObjectName;
+	}
+	FRRedirects::Redirect(ObjectPath, SplitPackage);
 
 	/* Something inside a map, which is not an asset and cannot be asked for as one. */
 	FString Held;
@@ -280,7 +316,7 @@ void IImporter::LoadExport(const TSharedPtr<FJsonObject>* PackageIndex, TObjectP
 	 * apart: kept together, the picture belongs in it under its own name. */
 	FString Lands;
 
-	if (FTextureTypes::IsSupported(ObjectType) && GetSettings()->AssetSettings.PackagedAssets == ERPackagedAssets::Separate) {
+	if (bSplitTexture) {
 		FString Leaf;
 
 		if (ObjectPath.Split(TEXT("/"), nullptr, &Leaf, ESearchCase::CaseSensitive, ESearchDir::FromEnd) && !Leaf.IsEmpty() && Leaf != ObjectName) {

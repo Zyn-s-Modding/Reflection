@@ -1028,30 +1028,31 @@ void UPropertySerializer::DeserializePropertyValue(FProperty* Property, const TS
 		}
 
 		if (StructProperty->Struct->GetFName() == "SoftObjectPath") {
-			TSharedPtr<FJsonObject> SoftJsonObjectProperty;
-			FString PathString = "";
+			FString PathString;
+			const TSharedPtr<FJsonObject>* Fields = nullptr;
+			if (NewJsonValue->TryGetObject(Fields) && Fields != nullptr && Fields->IsValid()) {
+				if (!(*Fields)->TryGetStringField(TEXT("AssetPathName"), PathString)) return;
+				FString SubPath;
+				if (!PathString.IsEmpty() && PathString != TEXT("None") &&
+					(*Fields)->TryGetStringField(TEXT("SubPathString"), SubPath) && !SubPath.IsEmpty()) {
+					PathString += TEXT(":") + SubPath;
+				}
+			} else if (!NewJsonValue->TryGetString(PathString) && !NewJsonValue->IsNull()) {
+				return;
+			}
 
-			SoftJsonObjectProperty = NewJsonValue->AsObject();
-			PathString = SoftJsonObjectProperty->GetStringField(TEXT("AssetPathName"));
-			
-			if (PathString != "") {
-				const FSoftObjectPath Reference(PathString);
+			// A struct property stores the path directly. Only a soft object property has a weak pointer.
+			FSoftObjectPath& Reference = *static_cast<FSoftObjectPath*>(OutValue);
+			Reference = FSoftObjectPath(PathString == TEXT("None") ? FString() : PathString);
 
-				FSoftObjectPtr* ObjectPtr = static_cast<FSoftObjectPtr*>(OutValue);
-				*ObjectPtr = Reference;
-
-				if (!AlreadyHere(Reference)) {
-					/* Try importing it using Cloud */
-					FString PackagePath;
-					FString AssetName;
-					PathString.Split(".", &PackagePath, &AssetName);
-					TObjectPtr<UObject> T = nullptr;
-
-					FString PropertyClassName = "DataAsset";
-				
-					IImporter::DownloadWrapper(T, PropertyClassName, AssetName, PackagePath);
+			if (!Reference.IsNull() && !AlreadyHere(Reference)) {
+				FString PackagePath;
+				FString AssetName;
+				if (Reference.GetAssetPathString().Split(TEXT("."), &PackagePath, &AssetName)) {
+					IImporter::DownloadWrapper(TObjectPtr<UObject>(), TEXT("DataAsset"), AssetName, PackagePath);
 				}
 			}
+			return;
 		}
 		
 		/* JSON for FGuids are FStrings */
@@ -1131,51 +1132,39 @@ void UPropertySerializer::DeserializePropertyValue(FProperty* Property, const TS
 		}
 	}
 	else if (const FByteProperty* ByteProperty = CastField<const FByteProperty>(Property)) {
-		/* If we have a string provided, make sure Enum is not null */
-		if (JsonValue->Type == EJson::String) {
-			FString EnumAsString = JsonValue->AsString();
-
-			if (!ByteProperty->Enum)
-			{
-				return;
-			}
-			
-			int64 EnumerationValue = ByteProperty->Enum->GetValueByNameString(EnumAsString);
-
-			/* Somethings wrong!!! */
-			if (EnumerationValue == -1) {
-				UE_LOG(LogReflection, Warning, TEXT("Invalid enum value for property '%s'!"), *Property->GetName());
-
-				UE_LOG(LogReflection, Warning, TEXT("Enum name: %s"), *EnumAsString);
-				UE_LOG(LogReflection, Warning, TEXT("Enum type: %s"), *ByteProperty->Enum->GetName());
-				UE_LOG(LogReflection, Warning, TEXT("Available values:"));
-
-				for (int32 Index = 0; Index < ByteProperty->Enum->NumEnums() - 1; ++Index)
-				{
-					FString Name = ByteProperty->Enum->GetNameStringByIndex(Index);
-					int64 Value = ByteProperty->Enum->GetValueByIndex(Index);
-					UE_LOG(LogReflection, Warning, TEXT("  [%d] %s = %lld"), Index, *Name, Value);
+		const UEnum* Enum = ByteProperty->Enum;
+		int64 Value = INDEX_NONE;
+		if (NewJsonValue->Type == EJson::Number) {
+			Value = static_cast<int64>(NewJsonValue->AsNumber());
+		} else if (NewJsonValue->Type == EJson::String && Enum != nullptr) {
+			const FString Written = NewJsonValue->AsString();
+			Value = Enum->GetValueByNameString(Written);
+			if (Value == INDEX_NONE) {
+				// Mirror can write an unnamed enum byte as an enum-qualified number.
+				FString Number = Written;
+				FString EnumName;
+				if (!Written.Split(TEXT("::"), &EnumName, &Number) || EnumName == Enum->GetName()) {
+					int64 Parsed = 0;
+					if (LexTryParseString(Parsed, *Number) && Enum->IsValidEnumValue(Parsed)
+						&& !Enum->GetNameStringByValue(Parsed).EndsWith(TEXT("_MAX"))) {
+						Value = Parsed;
+					}
 				}
-
-				EnumerationValue = 0;
 			}
-			
-			ByteProperty->SetIntPropertyValue(OutValue, EnumerationValue);
+		} else {
+			return;
 		}
-		else {
-			/* Should be a number, set property value accordingly */
-			const int64 NumberValue = static_cast<int64>(NewJsonValue->AsNumber());
 
-			/* A number the enum has no name for, which is what old data leaves lying about. */
-			if (ByteProperty->Enum != nullptr && !ByteProperty->Enum->IsValidEnumValue(NumberValue)) {
-				UE_LOG(LogReflectionPropertySerializer, Warning, TEXT("\"%s\" is a %s, which has no %lld, so it was left as it was built"), *GetPropertyName(ByteProperty).ToString(), *ByteProperty->Enum->GetName(), NumberValue);
-
-				return;
+		if (Enum != nullptr && (Value == INDEX_NONE || !Enum->IsValidEnumValue(Value))) {
+			// Niagara rebuilds advanced pin visibility from the pin flags when this byte is unusable.
+			if (Enum->GetFName() != FName(TEXT("ENodeAdvancedPins"))) {
+				UE_LOG(LogReflectionPropertySerializer, Warning, TEXT("Unsupported %s value '%s' for %s; kept the current value"),
+					*Enum->GetName(), *NewJsonValue->AsString(), *GetPropertyName(ByteProperty).ToString());
 			}
-
-			ByteProperty->SetIntPropertyValue(OutValue, NumberValue);
+			return;
 		}
-		/* Primitives below, they are serialized as plain json values */
+
+		ByteProperty->SetIntPropertyValue(OutValue, Value);
 	}
 	else if (const FNumericProperty* NumberProperty = CastField<const FNumericProperty>(Property)) {
 		const double NumberValue = NewJsonValue->AsNumber();

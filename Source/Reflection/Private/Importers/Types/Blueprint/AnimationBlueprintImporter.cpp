@@ -3,6 +3,7 @@
 #include "Importers/Types/Blueprint/AnimationBlueprintImporter.h"
 #include "Importers/Types/Blueprint/BlueprintCompile.h"
 #include "AnimGraphNode_BlendListByInt.h"
+#include "AnimGraphNode_TwoWayBlend.h"
 /* 4.23 is where a node driving something of its own grew a base of its own */
 #if !UE4_22_BELOW
 #include "AnimGraphNode_CustomProperty.h"
@@ -216,7 +217,7 @@ bool IAnimationBlueprintImporter::Import() {
 	 * asserts outright when any blueprint of that name is already in the package. */
 	if (!AnimBlueprint && GetPackage()) {
 		UBlueprint* ExistingBlueprint = FindObject<UBlueprint>(GetPackage(), *GetAssetName());
-		if (!ExistingBlueprint) ExistingBlueprint = LoadObject<UBlueprint>(nullptr, *GetPackage()->GetPathName());
+		if (!ExistingBlueprint) ExistingBlueprint = LoadObjectByPath<UBlueprint>(GetPackage()->GetName() + TEXT(".") + GetAssetName());
 
 		if (ExistingBlueprint) {
 			AnimBlueprint = Cast<UAnimBlueprint>(ExistingBlueprint);
@@ -248,7 +249,7 @@ bool IAnimationBlueprintImporter::Import() {
 		/* An animation blueprint is built on the class it was written against, and a build without
 		 * that class has nothing to build it on. Making one anyway is asked of the engine, which
 		 * takes the parent apart without checking it is there. */
-		if (ParentClass == nullptr) {
+		if (!ClassIsFormed(ParentClass) || !ParentClass->IsChildOf<UAnimInstance>()) {
 			FImportIssues::Report(
 				EImportIssue::MissingClass,
 				TEXT("Couldn't resolve the parent class"),
@@ -1530,7 +1531,7 @@ void IAnimationBlueprintImporter::Hands(const FString& Key, const FName Member, 
  * right way up every frame. The compiler only makes a copy that negates from a graph it recognises:
  * a read of the variable, broken down to the member, then a Not. That is what is drawn, one break
  * for each struct along the way, and the compiler makes the one copy from it that the class has. */
-static bool DrawTurnedThrough(UAnimGraphNode_Base* Node, const FName Member, const TArray<FString>& Path, const int32 Row) {
+static bool DrawStructInput(UAnimGraphNode_Base* Node, const FName Member, const TArray<FString>& Path, bool bTurned, const int32 Row) {
 	UEdGraph* Into = Node->GetGraph();
 	UEdGraphPin* Onto = Node->FindPin(Member, EGPD_Input);
 
@@ -1599,9 +1600,17 @@ static bool DrawTurnedThrough(UAnimGraphNode_Base* Node, const FName Member, con
 	}
 
 	if (Held == nullptr) {
-		UE_LOG(LogReflection, Warning, TEXT("\"%s\" turned round for %s could not be broken down to"), *FString::Join(Path, TEXT(".")), *Member.ToString());
+		UE_LOG(LogReflection, Warning, TEXT("\"%s\" could not be read for %s"), *FString::Join(Path, TEXT(".")), *Member.ToString());
 
 		return false;
+	}
+
+	if (!bTurned) {
+		Held->MakeLinkTo(Onto);
+		Reads->NodePosX = Node->NodePosX - 220 * Across;
+		Reads->NodePosY = Node->NodePosY + Row * 90;
+		Into->NotifyGraphChanged();
+		return true;
 	}
 
 	UK2Node_CallFunction* Turns = NewObject<UK2Node_CallFunction>(Into, UK2Node_CallFunction::StaticClass(), NAME_None, RF_Transactional);
@@ -1650,8 +1659,16 @@ void IAnimationBlueprintImporter::ApplyBindings(const FString& Key, UAnimGraphNo
 	 * A way in that needs more than a single read something reached through a struct has no
 	 * one node to draw, so that stays a binding. */
 	int32 Row = 0;
+	const UClass* BindingClass = AnimBlueprint->SkeletonGeneratedClass;
+	if (!BindingClass) BindingClass = AnimBlueprint->ParentClass;
 
 	for (const FHandedOver& One : *Says) {
+		if (!BindingClass || !FindFProperty<FProperty>(BindingClass, FName(*One.Path[0]))) {
+			UE_LOG(LogReflection, Warning, TEXT("\"%s\" would drive %s.%s, but the source property is unavailable"),
+				*FString::Join(One.Path, TEXT(".")), *Key, *One.Member.ToString());
+			continue;
+		}
+
 		/* Drawn on the node whichever way it is fed.
 		 *
 		 * A property that is hidden reads as a property nobody set, and for one holding an asset
@@ -1669,10 +1686,10 @@ void IAnimationBlueprintImporter::ApplyBindings(const FString& Key, UAnimGraphNo
 			continue;
 		}
 
-		/* Turned round, which a binding has no way of saying, so drawn whatever the way to it */
-		if (One.bTurned) {
-			if (!DrawTurnedThrough(Node, One.Member, One.Path, Row++)) {
-				UE_LOG(LogReflection, Warning, TEXT("\"%s\" is handed to %s.%s turned round, and could not be drawn"),
+		// Control Rig inputs use compiler-generated transfer properties.
+		if (One.bTurned || Node->GetClass()->GetFName() == TEXT("AnimGraphNode_ControlRig")) {
+			if (!DrawStructInput(Node, One.Member, One.Path, One.bTurned, Row++)) {
+				UE_LOG(LogReflection, Warning, TEXT("\"%s\" could not be wired to %s.%s"),
 					*FString::Join(One.Path, TEXT(".")), *Node->GetName(), *One.Member.ToString());
 			}
 
@@ -2269,8 +2286,27 @@ void IAnimationBlueprintImporter::CreateAnimGraphNodes(UEdGraph* AnimGraph, cons
 		}
 
 		const UClass* Class = FindClassByType(NodeType);
+		bool bPoseFallback = false;
 
-		if (!Class) {
+		if (!Class && (NodeType == TEXT("AnimGraphNode_RigMapper") || NodeType == TEXT("FortAnimGraphNode_BlendFacialCurves"))) {
+			const bool bCurveBlend = NodeType == TEXT("FortAnimGraphNode_BlendFacialCurves");
+			const TCHAR* SourcePin = bCurveBlend ? TEXT("FirstPose") : TEXT("SourcePose");
+			if (const TSharedPtr<FJsonObject>* Source = nullptr; Value->TryGetObjectField(SourcePin, Source)) {
+				// Keep the primary pose flowing when the target editor lacks the cooked mapping node.
+				TSharedPtr<FJsonObject> Fallback = MakeShared<FJsonObject>();
+				Fallback->SetObjectField(TEXT("A"), *Source);
+				Fallback->SetNumberField(TEXT("Alpha"), 0.0);
+				if (const TSharedPtr<FJsonObject>* Second = nullptr; bCurveBlend && Value->TryGetObjectField(TEXT("SecondPose"), Second)) {
+					Fallback->SetObjectField(TEXT("B"), *Second);
+				}
+				Value = MoveTemp(Fallback);
+				Class = UAnimGraphNode_TwoWayBlend::StaticClass();
+				bPoseFallback = true;
+				UE_LOG(LogReflection, Warning, TEXT("\"%s\" passes through %s because this editor has no %s"), *Key, SourcePin, *NodeType);
+			}
+		}
+
+		if (!Class || !Class->IsChildOf(UAnimGraphNode_Base::StaticClass()) || Class->HasAnyClassFlags(CLASS_Abstract)) {
 			UE_LOG(LogReflection, Warning, TEXT("\"%s\" is a %s, which this build has no node for"), *Key, *NodeType);
 
 			continue;
@@ -2278,6 +2314,7 @@ void IAnimationBlueprintImporter::CreateAnimGraphNodes(UEdGraph* AnimGraph, cons
 
 		UAnimGraphNode_Base* Node = NewObject<UAnimGraphNode_Base>(AnimGraph, ToNewObjectClass(Class), NAME_None, RF_Transactional);
 		Node->NodeGuid = NodeGuid;
+		if (bPoseFallback) Node->NodeComment = FString::Printf(TEXT("%s fallback"), *NodeType);
 
 		/* Add new node */
 		OutContainer.Exports.Add(
@@ -2496,9 +2533,17 @@ void IAnimationBlueprintImporter::HandleNodeDeserialization(FUObjectExportContai
 		GetObjectSerializer()->DeserializeObjectProperties(NodeProperties, Node);
 
 		/* Once what it runs is known, since the pins are drawn from what that says it takes */
+#if !UE4_22_BELOW
 		if (Handing.Num() > 0) {
-			ExposeHandedOver(Node, Handing);
+			const UClass* TargetClass = CastChecked<UAnimGraphNode_CustomProperty>(Node)->GetTargetClass();
+			if (TargetClass != nullptr) {
+				Handing.RemoveAll([TargetClass](const FString& Name) {
+					return FindFProperty<FProperty>(TargetClass, FName(*Name)) == nullptr;
+				});
+				if (Handing.Num() > 0) ExposeHandedOver(Node, Handing);
+			}
 		}
+#endif
 
 		/* Specific needs for certain nodes ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 		if (UAnimGraphNode_SaveCachedPose* SaveCachedPose = Cast<UAnimGraphNode_SaveCachedPose>(Node)) {

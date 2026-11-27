@@ -9,10 +9,13 @@
 
 #include "EdGraph/EdGraphNode.h"
 #include "NiagaraGraph.h"
+#include "NiagaraScript.h"
 #include "NiagaraScriptSource.h"
 
 bool INiagaraScriptImporter::Import() {
-	return FNiagaraGraphs::HasSerializedPins(GetContainer()) && IObjectImporter::Import();
+	if (!FNiagaraGraphs::HasSerializedPins(GetContainer())) return false;
+	FNiagaraGraphs::PrepareExports(*GetContainer(), *GetObjectSerializer());
+	return IObjectImporter::Import();
 }
 
 void INiagaraScriptImporter::Repair(UObject* Asset) const {
@@ -22,7 +25,15 @@ void INiagaraScriptImporter::Repair(UObject* Asset) const {
 
 	FNiagaraGraphStats Stats;
 
+	FNiagaraCookedCache::Restore(Container);
+	FNiagaraGraphs::ReportMissingScriptVersions(*Container);
+
+	if (!RestoreSource(Asset, Container)) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("Niagara script source graph is missing or ambiguous"));
+	}
+
 	FNiagaraGraphs::Rebuild(Container, GetPackage(), GetPropertySerializer(), Stats);
+	if (UNiagaraScript* Script = Cast<UNiagaraScript>(Asset)) FNiagaraGraphs::RestoreOutputUsage(*Script, !GetAssetData()->HasField(TEXT("Usage")));
 
 	if (Stats.Unpaired > 0) {
 		FImportIssues::Report(
@@ -32,12 +43,6 @@ void INiagaraScriptImporter::Repair(UObject* Asset) const {
 				TEXT("'%s' has nodes that pair their own pins off and name one that didn't come across, so the node drops the pairing and whatever fed the pin stops reaching what it stood for."),
 				*GetAssetName())
 		);
-	}
-
-	FNiagaraCookedCache::Restore(Container);
-
-	if (!RestoreSource(Asset, Container)) {
-		FImportIssues::Report(EImportIssue::Data, TEXT("Niagara script source graph is missing or ambiguous"));
 	}
 
 	if (Stats.Dangling > 0) {
@@ -69,8 +74,25 @@ bool INiagaraScriptImporter::RestoreSource(UObject* Script, FUObjectExportContai
 	const TArray<UObject*>& Candidates = Owned.Num() > 0 ? Owned : Shared;
 	UObject* Source = Candidates.Num() == 1 ? Candidates[0] : nullptr;
 
-	// A single owned source is sufficient for an unversioned script. A versioned script's
-	// revisions can have different graphs, so their serialized references are authoritative.
+	/* The optional editor package can keep all the sources while stripping the version table.
+	 * In that case use the newest numbered source from the same series for the one surviving
+	 * revision. The original per-revision references still take precedence when available. */
+	if (Source == nullptr && Versions.Num() == 1 && Owned.Num() > 1 && !FNiagaraVersions::HasObject(Versions[0], TEXT("Source"))) {
+		const FName FirstName = Owned[0]->GetFName();
+		UObject* Latest = Owned[0];
+		bool bSameSeries = true;
+		for (UObject* Candidate : Owned) {
+			const FName Name = Candidate->GetFName();
+			bSameSeries &= Name.GetPlainNameString() == FirstName.GetPlainNameString();
+			if (Name.GetNumber() > Latest->GetFName().GetNumber()) Latest = Candidate;
+		}
+		if (bSameSeries) {
+			Source = Latest;
+			FImportIssues::Report(EImportIssue::Data, TEXT("Niagara script version links were stripped"),
+				FString::Printf(TEXT("Used the newest exported source for %s"), *Script->GetName()));
+		}
+	}
+
 	bool bComplete = true;
 	for (const FNiagaraVersion& Version : Versions) {
 		if (FNiagaraVersions::HasObject(Version, TEXT("Source"))) continue;

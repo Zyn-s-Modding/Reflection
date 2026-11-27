@@ -7,6 +7,7 @@
 #include "Engine/ControlRigCompatibility.h"
 
 #include "RigVMCore/RigVMDispatchFactory.h"
+#include "RigVMCore/RigVMExternalVariable.h"
 #include "RigVMCore/RigVMRegistry.h"
 #include "RigVMCore/RigVMTemplate.h"
 #include "RigVMModel/RigVMController.h"
@@ -14,9 +15,16 @@
 #include "RigVMModel/Nodes/RigVMVariableNode.h"
 
 #include "Engine/Log.h"
+#include "Importers/Types/Blueprint/BlueprintCompile.h"
 #include "Serializers/PropertySerializer.h"
 
 namespace {
+	struct FRigVMVariableAccess : URigVMBlueprint {
+		static FName Add(URigVMBlueprint* Blueprint, const FRigVMExternalVariable& Variable, const FString& DefaultValue) {
+			return (Blueprint->*(&FRigVMVariableAccess::AddHostMemberVariableFromExternal))(Variable, DefaultValue);
+		}
+	};
+
 	template <typename TPin>
 	auto HasFixedSize(const TPin* Pin, int) -> decltype(Pin->IsFixedSizeArray()) {
 		return Pin->IsFixedSizeArray();
@@ -88,6 +96,7 @@ namespace {
 	constexpr int32 OpCodeCopy = 68;
 	constexpr int32 OpCodeExecute = 101;
 	constexpr int32 OpCodeRunInstructions = 102;
+	constexpr int32 OpCodeExecuteCallable = 104;
 
 	/* What a register operand says when it names no sub property */
 	constexpr int32 NoRegisterOffset = 65535;
@@ -191,7 +200,16 @@ bool FRigVMGraphReconstruction::Build(const FUObjectJsonValueExport& VirtualMach
 		return false;
 	}
 
-	const TArray<FUObjectJsonValueExport> Instructions = ByteCode.GetArray(TEXT("Instructions"));
+	TArray<FUObjectJsonValueExport> Instructions = ByteCode.GetArray(TEXT("Instructions"));
+	TArray<FUObjectJsonValueExport> BranchInfos;
+	if (ByteCode.Has(TEXT("BranchInfos"))) BranchInfos = ByteCode.GetArray(TEXT("BranchInfos"));
+	TArray<int32> EntryInstructions;
+	const TArray<TSharedPtr<FJsonValue>>* Entries = nullptr;
+	if (ByteCode.JsonObject->TryGetArrayField(TEXT("Entries"), Entries)) {
+		for (const TSharedPtr<FJsonValue>& Entry : *Entries) {
+			EntryInstructions.Add(ReadEntryInstruction(Entry->AsString()));
+		}
+	}
 
 	TArray<FString> FunctionNames;
 
@@ -204,6 +222,9 @@ bool FRigVMGraphReconstruction::Build(const FUObjectJsonValueExport& VirtualMach
 	Stats.Instructions = Instructions.Num();
 
 	ReadMemory(VirtualMachine);
+	ExpandCallables(ByteCode, Instructions, BranchInfos, EntryInstructions);
+	CollectNodes(Instructions, FunctionNames);
+	if (Nodes.IsEmpty()) return false;
 
 	/* The graph a new rig comes with holds the event it was created around, and a rig reflected
 	 * over an earlier run holds that run's nodes. Both are cleared before this one puts the rig's
@@ -212,17 +233,16 @@ bool FRigVMGraphReconstruction::Build(const FUObjectJsonValueExport& VirtualMach
 	 * Handed to RemoveNodes rather than removed one at a time: the graph's node array is the one
 	 * being emptied, so walking it while removing from it steps over every second node and leaves
 	 * half of the previous run's graph behind, unlinked, on top of the new one. */
-	Controller->RemoveNodes(Graph->GetNodes(), false, false);
-
 	/* Auto recompilation is what would make this slow: a rig of any size is a few hundred nodes,
 	 * and every one of them would otherwise recompile the VM on its way in */
+	const bool bAutoRecompile = Blueprint->GetAutoVMRecompile();
 	Blueprint->SetAutoVMRecompile(false);
+	Controller->RemoveNodes(Graph->GetNodes(), false, false);
 
-	CollectNodes(Instructions, FunctionNames);
 	CreateNodes();
 	ApplyDefaults();
 	CreateLinks(Instructions);
-	CreateExecution(Instructions, ByteCode);
+	CreateExecution(Instructions, BranchInfos, EntryInstructions);
 
 	/* A getter is made for one reader, and one whose reader refused the link, a pin this engine
 	 * build doesn't declare being how that happens, is left holding nothing */
@@ -246,7 +266,7 @@ bool FRigVMGraphReconstruction::Build(const FUObjectJsonValueExport& VirtualMach
 	UpdateLayout();
 	PromoteLocalVariables();
 
-	Blueprint->SetAutoVMRecompile(true);
+	Blueprint->SetAutoVMRecompile(bAutoRecompile);
 
 	return Stats.Nodes > 0;
 }
@@ -263,11 +283,12 @@ void FRigVMGraphReconstruction::ReadMemory(const FUObjectJsonValueExport& Virtua
 			}
 		}
 
-		if (!Storage.Has(TEXT("Properties"))) {
-			return;
-		}
+		const bool bHasProperties = Storage.Has(TEXT("Properties"));
+		const TCHAR* RegisterField = bHasProperties ? TEXT("Properties") : TEXT("PropertyDescs");
+		if (!Storage.Has(RegisterField)) return;
 
-		for (const FUObjectJsonValueExport& Property : Storage.GetArray(TEXT("Properties"))) {
+		const FUObjectJsonValueExport Values = Storage.GetObject(TEXT("Values"));
+		for (const FUObjectJsonValueExport& Property : Storage.GetArray(RegisterField)) {
 			FRegister Register;
 
 			if (Property.Has(TEXT("Name"))) {
@@ -276,6 +297,8 @@ void FRigVMGraphReconstruction::ReadMemory(const FUObjectJsonValueExport& Virtua
 
 			if (Property.Has(TEXT("Tag"))) {
 				Register.Value = Property.JsonObject->TryGetField(TEXT("Tag"));
+			} else if (Values.JsonObject.IsValid() && !Register.Name.IsEmpty()) {
+				Register.Value = Values.JsonObject->TryGetField(Register.Name);
 			}
 
 			OutRegisters.Add(Register);
@@ -284,6 +307,147 @@ void FRigVMGraphReconstruction::ReadMemory(const FUObjectJsonValueExport& Virtua
 
 	ReadStorage(VirtualMachine.GetObject(TEXT("DefaultWorkMemoryStorage")), Work, WorkPropertyPaths);
 	ReadStorage(VirtualMachine.GetObject(TEXT("LiteralMemoryStorage")), Literals, LiteralPropertyPaths);
+}
+
+void FRigVMGraphReconstruction::ExpandCallables(const FUObjectJsonValueExport& ByteCode, TArray<FUObjectJsonValueExport>& Instructions,
+	TArray<FUObjectJsonValueExport>& BranchInfos, TArray<int32>& EntryInstructions) {
+	if (!ByteCode.Has(TEXT("CallableInfos"))) return;
+	const TArray<FUObjectJsonValueExport> Callables = ByteCode.GetArray(TEXT("CallableInfos"));
+	if (Callables.IsEmpty() || Instructions.IsEmpty()) return;
+
+	TMap<int32, FUObjectJsonValueExport> ByIndex;
+	TBitArray<> CallableBody(false, Instructions.Num());
+	for (const FUObjectJsonValueExport& Callable : Callables) {
+		const int32 Index = Callable.GetInteger(TEXT("Index"), INDEX_NONE);
+		const int32 First = Callable.GetInteger(TEXT("FirstInstruction"), INDEX_NONE);
+		const int32 Last = Callable.GetInteger(TEXT("LastInstruction"), INDEX_NONE);
+		if (Index < 0 || First > Last || !Instructions.IsValidIndex(First) || !Instructions.IsValidIndex(Last)) continue;
+		ByIndex.Add(Index, Callable);
+		CallableBody.SetRange(First, Last - First + 1, true);
+	}
+	if (ByIndex.IsEmpty()) return;
+
+	TArray<FUObjectJsonValueExport> Expanded;
+	TArray<FUObjectJsonValueExport> ExpandedBranches;
+	TSet<int32> ActiveCalls;
+	const int32 OriginalWorkCount = Work.Num();
+	Expanded.Reserve(Instructions.Num());
+
+	// Each call gets its own work registers. Literals and external variables are shared with the caller.
+	using FRegisterMap = TMap<int32, int32>;
+	auto RemapOperand = [&](const FUObjectJsonValueExport& Operand, FRegisterMap* Registers) {
+		const int32 Index = Operand.GetInteger(TEXT("RegisterIndex"), INDEX_NONE);
+		if (Registers == nullptr || Operand.GetInteger(TEXT("MemoryType"), INDEX_NONE) != MemoryTypeWork ||
+			Index < 0 || Index >= OriginalWorkCount) return Operand.JsonObject;
+		int32* Remapped = Registers->Find(Index);
+		if (Remapped == nullptr) {
+			const FRegister Original = Work[Index];
+			Remapped = &Registers->Add(Index, Work.Add(Original));
+		}
+		const TSharedPtr<FJsonObject> Copy = MakeShared<FJsonObject>(*Operand.JsonObject);
+		Copy->SetNumberField(TEXT("RegisterIndex"), *Remapped);
+		return Copy;
+	};
+	auto AddCopy = [&Expanded](const TSharedPtr<FJsonObject>& Source, const TSharedPtr<FJsonObject>& Target) {
+		if (!Source.IsValid() || !Target.IsValid()) return;
+		const TSharedPtr<FJsonObject> Copy = MakeShared<FJsonObject>();
+		Copy->SetNumberField(TEXT("OpCode"), OpCodeCopy);
+		Copy->SetObjectField(TEXT("Source"), Source);
+		Copy->SetObjectField(TEXT("Target"), Target);
+		Expanded.Emplace(Copy);
+	};
+
+	// Splice each body in at the call site so the existing execution and data-link passes see the
+	// instruction order of the executed graph. Retarget branch ranges after nested calls are expanded.
+	TFunction<void(int32, int32, FRegisterMap*)> ExpandRange;
+	ExpandRange = [&](int32 First, int32 Last, FRegisterMap* Registers) {
+		TArray<int32> Offsets;
+		Offsets.Reserve(Last - First + 2);
+		TArray<int32> LazyInstructions;
+		for (int32 Index = First; Index <= Last; ++Index) {
+			Offsets.Add(Expanded.Num());
+			if (Registers == nullptr && CallableBody[Index]) continue;
+			const FUObjectJsonValueExport& Instruction = Instructions[Index];
+			const int32 OpCode = Instruction.GetInteger(TEXT("OpCode"), INDEX_NONE);
+			if (OpCode == OpCodeExecuteCallable) {
+				const int32 CallableIndex = Instruction.GetInteger(TEXT("CallableIndex"), INDEX_NONE);
+				const FUObjectJsonValueExport* Callable = ByIndex.Find(CallableIndex);
+				if (Callable == nullptr || ActiveCalls.Contains(CallableIndex) || ActiveCalls.Num() >= 128 || Expanded.Num() >= 1000000) {
+					Stats.SkippedCalls++;
+					continue;
+				}
+				const TArray<FUObjectJsonValueExport> Operands = Instruction.GetArray(TEXT("Arguments"));
+				const TArray<FUObjectJsonValueExport> Arguments = Callable->GetArray(TEXT("Arguments"));
+				if (Operands.Num() != Arguments.Num()) {
+					Stats.SkippedCalls++;
+					continue;
+				}
+				FRegisterMap CalleeRegisters;
+				for (int32 Arg = 0; Arg < Arguments.Num(); ++Arg) {
+					const int32 Direction = Arguments[Arg].GetInteger(TEXT("Direction"), INDEX_NONE);
+					if (Direction == static_cast<int32>(ERigVMPinDirection::Input) || Direction == static_cast<int32>(ERigVMPinDirection::IO)) {
+						AddCopy(RemapOperand(Operands[Arg], Registers), RemapOperand(Arguments[Arg].GetObject(TEXT("ForwardedOperand")), &CalleeRegisters));
+					}
+				}
+				ActiveCalls.Add(CallableIndex);
+				ExpandRange(Callable->GetInteger(TEXT("FirstInstruction")), Callable->GetInteger(TEXT("LastInstruction")), &CalleeRegisters);
+				ActiveCalls.Remove(CallableIndex);
+				for (int32 Arg = 0; Arg < Arguments.Num(); ++Arg) {
+					const int32 Direction = Arguments[Arg].GetInteger(TEXT("Direction"), INDEX_NONE);
+					if (Direction == static_cast<int32>(ERigVMPinDirection::Output) || Direction == static_cast<int32>(ERigVMPinDirection::IO)) {
+						AddCopy(RemapOperand(Arguments[Arg].GetObject(TEXT("ForwardedOperand")), &CalleeRegisters), RemapOperand(Operands[Arg], Registers));
+					}
+				}
+			} else if (OpCode == OpCodeRunInstructions) {
+				LazyInstructions.Add(Expanded.Add(Instruction));
+			} else if (Registers != nullptr && OpCode == OpCodeCopy) {
+				AddCopy(RemapOperand(Instruction.GetObject(TEXT("Source")), Registers), RemapOperand(Instruction.GetObject(TEXT("Target")), Registers));
+			} else if (Registers != nullptr && OpCode == OpCodeExecute && Instruction.Has(TEXT("Arguments"))) {
+				const TSharedPtr<FJsonObject> Copy = MakeShared<FJsonObject>(*Instruction.JsonObject);
+				TArray<TSharedPtr<FJsonValue>> Operands;
+				for (const FUObjectJsonValueExport& Operand : Instruction.GetArray(TEXT("Arguments"))) {
+					Operands.Add(MakeShared<FJsonValueObject>(RemapOperand(Operand, Registers)));
+				}
+				Copy->SetArrayField(TEXT("Arguments"), MoveTemp(Operands));
+				Expanded.Emplace(Copy);
+			} else {
+				Expanded.Add(Instruction);
+			}
+		}
+		Offsets.Add(Expanded.Num());
+		auto RemapRange = [&](const FUObjectJsonValueExport& Original, const TCHAR* StartField, const TCHAR* EndField) -> TSharedPtr<FJsonObject> {
+			const int32 Start = Original.GetInteger(StartField, INDEX_NONE);
+			const int32 End = Original.GetInteger(EndField, INDEX_NONE);
+			if (Start < First || Start > End || End > Last || Offsets[Start - First] == Offsets[End - First + 1]) return nullptr;
+			const TSharedPtr<FJsonObject> Copy = MakeShared<FJsonObject>(*Original.JsonObject);
+			Copy->SetNumberField(StartField, Offsets[Start - First]);
+			Copy->SetNumberField(EndField, Offsets[End - First + 1] - 1);
+			return Copy;
+		};
+		for (const int32 Lazy : LazyInstructions) {
+			if (const TSharedPtr<FJsonObject> Copy = RemapRange(Expanded[Lazy], TEXT("StartInstruction"), TEXT("EndInstruction"))) {
+				Expanded[Lazy] = FUObjectJsonValueExport(Copy);
+			} else {
+				Expanded[Lazy] = FUObjectJsonValueExport(MakeShared<FJsonObject>());
+			}
+		}
+		for (const FUObjectJsonValueExport& Branch : BranchInfos) {
+			const int32 Owner = Branch.GetInteger(TEXT("InstructionIndex"), INDEX_NONE);
+			if (Owner < First || Owner > Last || (Registers == nullptr && CallableBody[Owner])) continue;
+			if (const TSharedPtr<FJsonObject> Copy = RemapRange(Branch, TEXT("FirstInstruction"), TEXT("LastInstruction"))) {
+				Copy->SetNumberField(TEXT("InstructionIndex"), Offsets[Owner - First]);
+				ExpandedBranches.Emplace(Copy);
+			}
+		}
+		if (Registers == nullptr) {
+			for (int32& Entry : EntryInstructions) {
+				Entry = Entry >= First && Entry <= Last ? Offsets[Entry - First] : INDEX_NONE;
+			}
+		}
+	};
+	ExpandRange(0, Instructions.Num() - 1, nullptr);
+	Instructions = MoveTemp(Expanded);
+	BranchInfos = MoveTemp(ExpandedBranches);
 }
 
 /* One field out of a value, named the way a register offset names it: dot separated, an object's
@@ -1178,6 +1342,7 @@ void FRigVMGraphReconstruction::PromoteLocalVariables() {
 		if (Loose.Pin->GetSourceLinks(true).Num() > 0) continue;
 
 		const TArray<FRigVMGraphVariableDescription> Existing = Blueprint->GetMemberVariables();
+		FName VariableName(*Loose.VariableName);
 
 		const bool bExists = Existing.ContainsByPredicate([&Loose](const FRigVMGraphVariableDescription& Description) {
 			return Description.Name.ToString() == Loose.VariableName;
@@ -1196,15 +1361,19 @@ void FRigVMGraphReconstruction::PromoteLocalVariables() {
 				}
 			}
 
-			if (Blueprint->AddMemberVariable(FName(*Loose.VariableName), TypePath, false, false, Loose.Pin->GetDefaultValue()).IsNone()) {
+			const FRigVMExternalVariable Variable = RigVMTypeUtils::ExternalVariableFromCPPTypePath(VariableName, TypePath, false, false);
+			VariableName = FRigVMVariableAccess::Add(Blueprint, Variable, Loose.Pin->GetDefaultValue());
+			if (VariableName.IsNone()) {
 				continue;
 			}
+			// This rig can be a dependency of another asset whose deserialization is still in progress.
+			CompileBlueprintGuarded(Blueprint, EBlueprintCompileOptions::SkipGarbageCollection);
 		}
 
 		const FVector2D Position = Loose.Pin->GetNode()->GetPosition() + FVector2D(-480.0f, 40.0f);
 
 		URigVMNode* Getter = Controller->AddVariableNode(
-			FName(*Loose.VariableName),
+			VariableName,
 			Loose.Pin->GetCPPType(),
 			Loose.Pin->GetCPPTypeObject(),
 			true,
@@ -1741,36 +1910,35 @@ void FRigVMGraphReconstruction::CreateLinks(const TArray<FUObjectJsonValueExport
 	}
 }
 
-void FRigVMGraphReconstruction::CreateExecution(const TArray<FUObjectJsonValueExport>& Instructions, const FUObjectJsonValueExport& ByteCode) {
+void FRigVMGraphReconstruction::CreateExecution(const TArray<FUObjectJsonValueExport>& Instructions, const TArray<FUObjectJsonValueExport>& BranchInfos,
+	const TArray<int32>& EntryInstructions) {
 	TArray<FBlock> Blocks;
 
 	/* The branch table says which instructions run from which pin of a control flow node. The
 	 * instruction it names is the jump the compiler wrote, and the node it belongs to is the one
 	 * that ran just before it. */
-	if (ByteCode.Has(TEXT("BranchInfos"))) {
-		for (const FUObjectJsonValueExport& BranchInfo : ByteCode.GetArray(TEXT("BranchInfos"))) {
-			FBlock Block;
-			Block.First = BranchInfo.GetInteger(TEXT("FirstInstruction"), INDEX_NONE);
-			Block.Last = BranchInfo.GetInteger(TEXT("LastInstruction"), INDEX_NONE);
-			Block.Label = BranchInfo.Has(TEXT("Label")) ? BranchInfo.GetString(TEXT("Label")) : FString();
+	for (const FUObjectJsonValueExport& BranchInfo : BranchInfos) {
+		FBlock Block;
+		Block.First = BranchInfo.GetInteger(TEXT("FirstInstruction"), INDEX_NONE);
+		Block.Last = BranchInfo.GetInteger(TEXT("LastInstruction"), INDEX_NONE);
+		Block.Label = BranchInfo.Has(TEXT("Label")) ? BranchInfo.GetString(TEXT("Label")) : FString();
 
-			/* An argument index means the block is a value the node asks for when it needs it,
-			 * rather than a run of execution hanging off one of its pins */
-			Block.bLazy = BranchInfo.GetInteger(TEXT("ArgumentIndex"), INDEX_NONE) >= 0;
+		/* An argument index means the block is a value the node asks for when it needs it,
+		 * rather than a run of execution hanging off one of its pins */
+		Block.bLazy = BranchInfo.GetInteger(TEXT("ArgumentIndex"), INDEX_NONE) >= 0;
 
-			const int32 Instruction = BranchInfo.GetInteger(TEXT("InstructionIndex"), INDEX_NONE);
+		const int32 Instruction = BranchInfo.GetInteger(TEXT("InstructionIndex"), INDEX_NONE);
 
-			for (int32 Index = Instruction; Index >= 0; --Index) {
-				if (InstructionToNode.Contains(Index)) {
-					Block.Owner = Index;
+		for (int32 Index = Instruction; Index >= 0; --Index) {
+			if (InstructionToNode.Contains(Index)) {
+				Block.Owner = Index;
 
-					break;
-				}
+				break;
 			}
+		}
 
-			if (Block.First <= Block.Last && Block.First != INDEX_NONE) {
-				Blocks.Add(Block);
-			}
+		if (Block.First <= Block.Last && Block.First != INDEX_NONE) {
+			Blocks.Add(Block);
 		}
 	}
 
@@ -1812,15 +1980,6 @@ void FRigVMGraphReconstruction::CreateExecution(const TArray<FUObjectJsonValueEx
 	TArray<int32> SortedInstructions;
 	InstructionToNode.GetKeys(SortedInstructions);
 	SortedInstructions.Sort();
-
-	/* Entries are separate runs of the same graph, so each starts a chain of its own */
-	TArray<int32> EntryInstructions;
-
-	if (ByteCode.Has(TEXT("Entries"))) {
-		for (const TSharedPtr<FJsonValue>& Entry : ByteCode.JsonObject->GetArrayField(TEXT("Entries"))) {
-			EntryInstructions.Add(ReadEntryInstruction(Entry->AsString()));
-		}
-	}
 
 	for (const int32 Instruction : SortedInstructions) {
 		const int32 NodeIndex = InstructionToNode.FindChecked(Instruction);

@@ -63,10 +63,12 @@ bool ISoundWaveImporter::Import() {
 	/* Waves are what the sound groups act on, and a project missing them is worth saying once */
 	ISoundGraph::NotifySoundGroupsUnconfigured();
 
-	/* Cloud knows this by the path it had before the redirects and the export directory had their
-	 * say, and the factory below is handed the same path back through them */
-	FString FetchPath = GetPackage()->GetPathName();
-	FRRedirects::Reverse(FetchPath);
+	const FString Destination = GetPackage()->GetPathName();
+	FString FetchPath;
+	if (!GetAssetExport()->TryGetStringField(TEXT("Package"), FetchPath) || FetchPath.IsEmpty()) {
+		FetchPath = Destination;
+		FRRedirects::Reverse(FetchPath);
+	}
 
 	FString SavePath;
 
@@ -82,8 +84,17 @@ bool ISoundWaveImporter::Import() {
 		return false;
 	}
 
-	FString ObjectPath = FetchPath + TEXT(".") + GetAssetName();
-	FRRedirects::Redirect(ObjectPath);
+	// Mirror returns the original cooked file when its decoder is unavailable. Sending it to
+	// AssetTools without a matching audio factory can assert during automated import.
+	const FString Extension = FPaths::GetExtension(SavePath).ToLower();
+	if (Extension == TEXT("rada") || Extension == TEXT("binka") || Extension == TEXT("wem")
+		|| Extension == TEXT("at9") || Extension == TEXT("opus") || Extension == TEXT("adpcm")) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("A decoder is needed to import this sound wave"),
+			FString::Printf(TEXT("Mirror returned .%s audio for %s"), *Extension, *FetchPath));
+		return false;
+	}
+
+	const FString ObjectPath = Destination + TEXT(".") + GetAssetName();
 
 	USoundWave* SoundWave = ImportAudioFile(SavePath, ObjectPath);
 

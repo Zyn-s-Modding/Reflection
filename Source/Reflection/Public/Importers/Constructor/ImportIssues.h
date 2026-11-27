@@ -4,6 +4,9 @@
 
 #include "CoreMinimal.h"
 
+class FJsonObject;
+class FJsonValue;
+
 enum class EImportIssue : uint8 {
 	/* The asset didn't import */
 	Failed,
@@ -58,6 +61,23 @@ public:
 
 	static void Report(EImportIssue Kind, const FString& Summary, const FString& Detail = FString());
 	static void ReportFor(const FString& Name, const FString& Path, const FString& Type, EImportIssue Kind, const FString& Summary, const FString& Detail = FString());
+
+	/* Fields the source data carried that this engine's type has no property for.
+	 *
+	 * The writer fills a type from its own properties, so anything the source has that this engine
+	 * calls something else, or hasn't got at all, used to be dropped without a word. That is how a
+	 * renamed field (a renderer binding's attribute, kept as RootName in newer engines and as
+	 * RootVariable here) came out silently at its default. Every such field is reported now, by type,
+	 * so what didn't come across is always said. Fields a converter elsewhere carries over are
+	 * registered with MarkFieldHandled and left out of the report. */
+	static void ReportUnplacedFields(const UStruct* Type, const FJsonObject& Fields);
+	static void MarkFieldHandled(const FString& TypeName, const FString& Field);
+
+	/* The value a property this engine has is filled from when the source calls the field
+	 * something else (Resources/ReflectionFields.json, Aliases), mapped to this engine's value
+	 * where the two spell it differently. Null when there is no alias or the source has no such
+	 * field either. */
+	static TSharedPtr<FJsonValue> AliasedValue(const UStruct* Type, const FString& Property, const FJsonObject& Fields);
 
 	/* A reference that resolved to nothing. Within is how it was spelled where it names something inside an asset. */
 	static void ReportUnresolvedReference(const FString& Type, const FString& Name, const FString& Path, const FString& Within = FString());

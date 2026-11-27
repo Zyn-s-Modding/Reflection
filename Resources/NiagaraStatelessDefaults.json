@@ -1,0 +1,27 @@
+{
+  "About": "Class defaults of newer engines' stateless Niagara modules (NiagaraStatelessModule_*), read by the stateless-to-CPU conversion. A cooked object leaves out every field equal to its class default, and these classes are native and not in this engine, so their defaults are written down here. Each was inferred from the 43.x corpus (a value a field never carries while often leaving the field out), or is the engine's own attribute default. Keys are Module.Field; Value is a number or [x, y, z, w]; ApplyWhenOmitted sets the input even when the export leaves the field out, for the few where this engine's module default differs. Add an entry to teach the conversion a default; every use of one is reported in the import.",
+  "Defaults": {
+    "EmitterState.LoopDuration": { "Value": 1, "ApplyWhenOmitted": true },
+    "InitializeParticle.LifetimeDistribution": { "Value": 1 },
+    "InitializeParticle.ColorDistribution": { "Value": [1, 1, 1, 1] },
+    "InitializeParticle.MassDistribution": { "Value": 1 },
+    "InitializeParticle.SpriteSizeDistribution": { "Value": 10 },
+    "InitializeParticle.MeshScaleDistribution": { "Value": 1 },
+    "InitializeParticle.SpriteRotationDistribution": { "Value": 0 },
+    "AddVelocity.LinearVelocityDistribution": { "Value": [0, 0, 100, 0], "ApplyWhenOmitted": true },
+    "AddVelocity.PointVelocityDistribution": { "Value": 100, "ApplyWhenOmitted": true },
+    "AddVelocity.ConeVelocityDistribution": { "Value": 100, "ApplyWhenOmitted": true },
+    "ShapeLocation.BoxSize": { "Value": 100 },
+    "ShapeLocation.PlaneSize": { "Value": 100 },
+    "ShapeLocation.SphereRadius": { "Value": 100 },
+    "ShapeLocation.CylinderRadius": { "Value": 100 },
+    "ShapeLocation.CylinderHeight": { "Value": 100 },
+    "ShapeLocation.RingRadius": { "Value": 100 },
+    "ShapeLocation.DiscCoverage": { "Value": 0 },
+    "LightAttributes.Radius": { "Value": 100 },
+    "LightAttributes.FalloffExponent": { "Value": 1 },
+    "LightAttributes.DiffuseScale": { "Value": 1 },
+    "LightAttributes.SpecularScale": { "Value": 1 },
+    "LightAttributes.VolumetricScattering": { "Value": 1 }
+  }
+}

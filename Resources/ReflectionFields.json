@@ -1,0 +1,38 @@
+{
+  "About": "What the import knows about source fields this engine's types don't have a property of the same name for. Read once per editor session. Aliases: a property this engine has, filled from a field the source calls something else (Type.Property: {From, Map}); Map turns the source value (an enum's leaf name, or a number or bool written as text) into this engine's, with * for anything else. Rebuilt: built data the importer has the engine make again from the imported asset (Type: {Fields, By}), reported on a line of its own as rebuilt, not left out. Ignored: fields that are not data to carry (the exporter's own header for an object, values the exporter works out from others, caches the editor rebuilds on load or compile), left out of the 'Fields this engine has no property for' report. A type's entries apply to the types derived from it; * applies to every type. Every other field the source has and this engine can't place is still reported by type and name.",
+  "Aliases": {
+    "PerPlatformInt.Default": { "From": "Value" },
+    "PerPlatformFloat.Default": { "From": "Value" },
+    "PerPlatformBool.Default": { "From": "Value" },
+    "PerPlatformFrameRate.Default": { "From": "Value" },
+    "Vector2MaterialInput.ConstantX": { "From": "Constant.X" },
+    "Vector2MaterialInput.ConstantY": { "From": "Constant.Y" }
+  },
+  "Rebuilt": {
+    "SkeletalMeshSamplingLODBuiltData": { "Fields": ["AreaWeightedTriangleSampler"], "By": "the whole-mesh sampler for each LOD, built by FSkeletalMeshSamplingInfo::BuildWholeMesh after the mesh is imported" },
+    "SkeletalMeshSamplingRegionBuiltData": { "Fields": ["TriangleIndices", "Vertices", "BoneIndices", "AreaWeightedSampler"], "By": "each sampling region's triangles, vertices, bones and sampler, built by FSkeletalMeshSamplingInfo::BuildRegions after the mesh is imported" },
+    "StaticMesh": { "Fields": ["LightingGuid"], "By": "made new when the mesh is built" }
+  },
+  "Ignored": {
+    "*": {
+      "Fields": ["Class", "Flags", "Name", "Outer", "Type", "Package", "Template", "SuperStruct", "bCooked"],
+      "Why": "the exporter's header for an object written inline, and the cooked flag of per-platform values"
+    },
+    "Quat": { "Fields": ["IsNormalized", "Size", "SizeSquared"], "Why": "worked out by the exporter from X, Y, Z and W" },
+    "Transform": { "Fields": ["IsRotationNormalized"], "Why": "worked out by the exporter from the rotation" },
+    "ExpressionInput": { "Fields": ["ExpressionName"], "Why": "the material graph rebuild links inputs by expression itself" },
+    "MaterialInput": { "Fields": ["ExpressionName"], "Why": "the material graph rebuild links inputs by expression itself" },
+    "Material": { "Fields": ["CachedExpressionData", "LoadedMaterialResources", "ReferencedDefaultTextures"], "Why": "cooked caches the editor rebuilds when the material compiles" },
+    "MaterialInstanceConstant": { "Fields": ["CachedData", "LoadedMaterialResources", "ReferencedDefaultTextures"], "Why": "cooked caches the editor rebuilds when the instance compiles" },
+    "NiagaraSystem": { "Fields": ["EmitterCompiledStructs", "ScriptRuntimeCompiledDataForEditor", "ScriptRuntimeCookedDataMap", "SystemStateDataStruct"], "Why": "cooked compile results: the emitter compiled structs are read by the system importer itself, and the rest is rebuilt when the system compiles again on save" },
+    "VersionedNiagaraEmitterData": { "Fields": ["InterpolatedSpawnMode"], "Why": "carried by the spawn script's usage, which the emitter importer matches bInterpolatedSpawning to" },
+    "NiagaraVMExecutableDataId": { "Fields": ["InterpolatedSpawnMode"], "Why": "part of a cooked compile id; the scripts compile again" },
+    "NiagaraDataInterfaceGeneratedFunction": { "Fields": ["DefinitionName", "InstanceName", "MiscUsageBitMask", "Specifiers"], "Why": "cooked compile results; the scripts compile again" },
+    "NiagaraFunctionSignature": { "Fields": ["SourceFile", "SourceLine"], "Why": "where the function was declared in the newer engine's source, for its debugger" },
+    "SkeletalMeshLODInfo": { "Fields": ["CachedHasVertexColors", "CachedMorphTargetNames", "CachedSkinWeightProfileNames", "CachedVertexColorGuid", "TriangleCount", "VertexCount", "Bounds"], "Why": "worked out from the mesh, which is rebuilt from its render data" },
+    "MeshSectionInfo": { "Fields": ["FirstIndex", "MaxVertexIndex", "MinVertexIndex", "NumTriangles"], "Why": "copied from the render data the mesh is rebuilt from" },
+    "SkeletalMesh": { "Fields": ["LODModels", "NaniteResources", "SkeletalMaterials"], "Why": "read by the skeletal mesh importer itself (geometry, and materials matched by slot)" },
+    "Skeleton": { "Fields": ["ReferenceSkeleton", "Guid", "NameMappings", "ExistingMarkerNames", "AnimRetargetSources"], "Why": "read by the skeleton importer itself" },
+    "TextureSource": { "Fields": ["LayerColorInfo_LockProtected"], "Why": "an internal copy the texture source keeps of its layer info" }
+  }
+}

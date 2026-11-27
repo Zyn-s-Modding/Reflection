@@ -21,6 +21,7 @@
 #include "Engine/FontFace.h"
 #include "Importers/Constructor/ImportIssues.h"
 #include "Importers/Constructor/ImportReader.h"
+#include "Interfaces/IPluginManager.h"
 #include "Modules/Cloud/Cloud.h"
 #include "Settings/Runtime.h"
 #include "Settings/Blacklist.h"
@@ -38,6 +39,77 @@ static void StripExportDirectory(FString& Path) {
 	Path.Split(Directory + "/", nullptr, &Path, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 }
 
+bool FAssetUtilities::TryGetEngineContentDestination(const FString& Path, FString& Destination) {
+	const FRSettings& Settings = GetSettings()->AssetSettings;
+	if (!Settings.bRedirectEngineContent) return false;
+
+	FString Source = Path;
+	StripExportDirectory(Source);
+	Source.RemoveFromStart(TEXT("/"));
+
+	if (Source.StartsWith(TEXT("Engine/Plugins/"))) {
+		FString PluginPath, RelativePath;
+		if (!Source.Split(TEXT("/Content/"), &PluginPath, &RelativePath) || RelativePath.IsEmpty()) return false;
+		Source = FPaths::GetCleanFilename(PluginPath) / RelativePath;
+	} else if (Source.StartsWith(TEXT("Engine/"))) {
+		if (Source.StartsWith(TEXT("Engine/Content/"))) {
+			Source = TEXT("Engine/") + Source.RightChop(FCString::Strlen(TEXT("Engine/Content/")));
+		}
+	} else {
+		FString Mount;
+		if (!Source.Split(TEXT("/"), &Mount, nullptr) || Mount.Equals(TEXT("Game"))) return false;
+
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(Mount);
+		if (!Plugin.IsValid() || Plugin->GetLoadedFrom() != EPluginLoadedFrom::Engine) return false;
+	}
+
+	FString Folder = Settings.EngineContentFolder.TrimStartAndEnd();
+	while (Folder.RemoveFromEnd(TEXT("/"))) {}
+	const FString Package = Folder / TEXT("EngineContent");
+	const FName Root = FPackageName::GetPackageMountPoint(Package);
+	const TSharedPtr<IPlugin> ProjectPlugin = IPluginManager::Get().FindPlugin(Root.ToString());
+	const bool bProjectFolder = Root == FName(TEXT("Game")) || (ProjectPlugin.IsValid() && ProjectPlugin->GetLoadedFrom() == EPluginLoadedFrom::Project);
+	if (!bProjectFolder || !FPackageName::IsValidLongPackageName(Package)) {
+		Folder = FRSettings::DefaultEngineContentFolder;
+	}
+
+	Destination = Folder / Source;
+	return true;
+}
+
+/* Deferred saves ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+namespace {
+	/* In the order they were first asked for, each once. Weak, since a package the run threw away
+	 * is not one to write. */
+	TArray<TWeakObjectPtr<UPackage>> GPendingSaves;
+}
+
+void FAssetUtilities::QueueSave(UPackage* Package) {
+	if (Package == nullptr) return;
+
+	if (ImportDepth <= 0) {
+		SavePackage(Package);
+
+		return;
+	}
+
+	GPendingSaves.AddUnique(Package);
+}
+
+void FAssetUtilities::FlushSaves() {
+	/* Taken out first, since a save can reach code that queues another */
+	while (GPendingSaves.Num() > 0) {
+		TArray<TWeakObjectPtr<UPackage>> Saving = MoveTemp(GPendingSaves);
+		GPendingSaves.Reset();
+
+		for (const TWeakObjectPtr<UPackage>& Weak : Saving) {
+			if (UPackage* Package = Weak.Get()) {
+				SavePackage(Package);
+			}
+		}
+	}
+}
+
 /* CreateAssetPackage Implementations ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 UPackage* FAssetUtilities::CreateAssetPackage(const FString& Path) {
 	/* A path off disk rather than a package path gets this far when the export was reflected from
@@ -52,6 +124,19 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Path) {
 
 		return nullptr;
 	}
+
+	if (!IsAllowedDestination(Path)) {
+		FImportIssues::Report(
+			EImportIssue::Failed,
+			TEXT("Outside the folder this run may write to"),
+			FString::Printf(TEXT("\"%s\" is not under %s, so it was not created"), *Path, *OnlyUnder)
+		);
+
+		return nullptr;
+	}
+
+	/* There now, whatever the run found when it asked before */
+	MissingPackagesThisRun.Remove(Path);
 
 	UPackage* Package = CreatePackage(
 		/* 4.25, 4.26.0 and below need an Outer */
@@ -76,6 +161,14 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Path) {
 
 UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString& OutputPath, FString& FailureReason) {
 	const FString& ProjectName = GReflectionRuntime.Profile.ProjectName;
+
+	FString Destination;
+	if (TryGetEngineContentDestination(OutputPath, Destination)) {
+		const FString PackagePath = FPaths::GetPath(Destination) / Name;
+		UPackage* Package = CreateAssetPackage(PackagePath);
+		if (Package == nullptr) FailureReason = FString::Printf(TEXT("\"%s\" is not a valid engine content destination package."), *PackagePath);
+		return Package;
+	}
 
 	FString ModifiablePath = OutputPath;
 
@@ -115,7 +208,7 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString
 
 			ModifiablePath = "/" + ModifiablePath + "/";
 
-			FRRedirects::Redirect(ModifiablePath);
+			FRRedirects::Redirect(ModifiablePath, ModifiablePath + Name);
 
 			/* Check if plugin exists */
 			if (IsPlugin && !ModifiablePath.StartsWith("/Game/")) {
@@ -124,12 +217,12 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString
 				PluginName.Split("/", &PluginName, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 
 				if (GetPlugin(PluginName) == nullptr) {
-					CreatePlugin(PluginName);
+					if (IsAllowedDestination(ModifiablePath)) CreatePlugin(PluginName);
 				}
 			}
 		}
 		else {
-			FRRedirects::Redirect(ModifiablePath);
+			FRRedirects::Redirect(ModifiablePath, ModifiablePath + Name);
 
 			if (!ModifiablePath.StartsWith("/Game/") && !ModifiablePath.StartsWith("/Engine/")) {
 				FString PluginName;
@@ -137,7 +230,7 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString
 				PluginName.Split("/", &PluginName, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 
 				if (GetPlugin(PluginName) == nullptr) {
-					CreatePlugin(PluginName);
+					if (IsAllowedDestination(ModifiablePath)) CreatePlugin(PluginName);
 				}
 			}
 		}
@@ -148,14 +241,14 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString
 		}
 
 		if (RootName != "Game" && RootName != "Engine" && GetPlugin(RootName) == nullptr) {
-			CreatePlugin(RootName);
+			if (IsAllowedDestination(ModifiablePath)) CreatePlugin(RootName);
 		}
 
 		ModifiablePath.Split("/", &ModifiablePath, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
 
 		ModifiablePath = ModifiablePath + "/";
 
-		FRRedirects::Redirect(ModifiablePath);
+		FRRedirects::Redirect(ModifiablePath, ModifiablePath + Name);
 	}
 
 	const FString PathWithGame = ModifiablePath + Name;
@@ -250,8 +343,11 @@ namespace {
 	 * file is in, and the asset's own name. */
 	template <typename T>
 	TObjectPtr<T> FindByReference(const FString& Path) {
-		FString Redirected = Path;
-		FRRedirects::Redirect(Redirected);
+		FString Redirected;
+		if (!FAssetUtilities::TryGetEngineContentDestination(Path, Redirected)) {
+			Redirected = Path;
+			FRRedirects::Redirect(Redirected);
+		}
 
 		if (TObjectPtr<T> Found = LoadObjectByPath<T>(Redirected)) {
 			return Found;
@@ -284,8 +380,10 @@ bool FAssetUtilities::ConstructAsset(const FString& Path, const FString& RealPat
 	 * where it lands here, since an entry can be written against either. Asked before the skeleton
 	 * exception below: a skeleton somebody blacklisted is one they meant to keep out. */
 	FString Blacklisted;
+	FString Destination;
+	const bool bRedirectedEngineContent = TryGetEngineContentDestination(RealPath, Destination);
 
-	if (FRBlacklist::IsBlacklisted(Type, Path, FString(), nullptr, &Blacklisted) || FRBlacklist::IsPathBlacklisted(RealPath, FString(), &Blacklisted)) {
+	if (FRBlacklist::IsBlacklisted(Type, Path, FString(), nullptr, &Blacklisted) || FRBlacklist::IsPathBlacklisted(bRedirectedEngineContent ? Destination : RealPath, FString(), &Blacklisted)) {
 		UE_LOG(LogReflection, Log, TEXT("Not reflecting \"%s\": %s"), *Path, *Blacklisted);
 
 		return false;
@@ -302,9 +400,32 @@ bool FAssetUtilities::ConstructAsset(const FString& Path, const FString& RealPat
 	 * The asset itself exists by this point, since it is created before its graph is filled in, so
 	 * what is in memory is what the reference wants. It is handed back half built and the import
 	 * that owns it finishes it. */
-	/* The switch is for a run that turns them off, the setting for somebody who wants only what they asked for */
-	if ((!bImportReferences || !GetSettings()->AssetSettings.ImportReferences) && Type != TEXT("Skeleton")) {
+	/* The switch is for a run that turns them off, the setting for somebody who wants only what they asked for.
+	 *
+	 * Except for a Niagara script or an enum, which the setting does not keep out. A module, dynamic
+	 * input or function a graph calls is part of what the graph is: without it the call has no
+	 * signature and fails to compile, and so does every node after it on the same parameter map,
+	 * which takes the whole script down with it (one missing helper in a System Update script was
+	 * 160 errors). An enum is the type of a static switch or a pin, and a switch with no enum fails
+	 * the same way. A texture or mesh left out still leaves an asset that works, a missing script or
+	 * enum does not. So those are fetched with the setting off too, and the run says so. The run
+	 * switch, which a commandlet turns off to fetch nothing at all, still keeps them out. */
+	const bool bReferencesWanted = bImportReferences && GetSettings()->AssetSettings.ImportReferences;
+	/* Decided by what asks for it, not by its type: anything a graph's own objects reference (the
+	 * module a node calls, the enum a pin is typed by, a parameter collection a node reads) */
+	const bool bNeededToCompile = GraphDependencyDepth > 0;
+	const bool bScriptAnyway = bImportReferences && !bReferencesWanted && bNeededToCompile;
+
+	if (!bReferencesWanted && Type != TEXT("Skeleton") && !bScriptAnyway) {
 		return false;
+	}
+
+	if (bScriptAnyway) {
+		FImportIssues::Report(
+			EImportIssue::Setting,
+			TEXT("Import References is off, but what the graphs reference was imported anyway: the graphs can't compile without it"),
+			Path
+		);
 	}
 
 	const bool IsTexture = FTextureTypes::IsSupported(Type);

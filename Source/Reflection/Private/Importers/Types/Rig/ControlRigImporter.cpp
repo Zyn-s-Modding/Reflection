@@ -701,6 +701,11 @@ void IControlRigImporter::ConstructGraph(UControlRigBlueprint* Blueprint) const 
 			FString::Printf(TEXT("%d nodes and %d links the graph refused."), Stats.FailedNodes, Stats.FailedLinks)
 		);
 	}
+
+	if (Stats.SkippedCalls > 0) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("Some RigVM calls could not be expanded"),
+			FString::Printf(TEXT("%d call instruction(s) were skipped."), Stats.SkippedCalls));
+	}
 }
 
 void IControlRigImporter::ConstructSettings(UControlRigBlueprint* Blueprint) const {

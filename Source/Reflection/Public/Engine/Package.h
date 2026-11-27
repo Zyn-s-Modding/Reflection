@@ -4,6 +4,7 @@
 
 
 #include "Engine/Compatibility.h"
+#include "Importers/Constructor/Asset.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Engine/FontFace.h"
 #include "NiagaraEffectType.h"
@@ -126,15 +127,30 @@ T* LoadObjectByPath(const FString& InPath) {
 
 	/* Not in memory and no file to read it out of, so there is nothing to load and no reason to
 	 * have the loader say so twice */
+	if (FAssetUtilities::IsKnownMissing(PackageName)) {
+		return nullptr;
+	}
+
 	if (!FPackageName::DoesPackageExist(PackageName)) {
+		/* Unless this run has it in memory and has not written it yet */
+		if (FindPackage(nullptr, *PackageName) == nullptr) {
+			FAssetUtilities::RememberMissing(PackageName);
+		}
+
 		return nullptr;
 	}
 
 	return Cast<T>(ResolveRedirector(StaticLoadObject(T::StaticClass(), nullptr, *Path, nullptr, LOAD_NoWarn | LOAD_Quiet)));
 }
 
-inline void SavePackage(UPackage* Package) {
+inline bool SavePackage(UPackage* Package) {
 	const FString PackageName = Package->GetName();
+
+	if (!FAssetUtilities::IsAllowedDestination(PackageName)) {
+		UE_LOG(LogTemp, Error, TEXT("Not saving \"%s\": it is outside %s, the only place this run may write"), *PackageName, *FAssetUtilities::OnlyUnder);
+
+		return false;
+	}
 
 	/* A level is written with an extension of its own, and the loader finds a package by it */
 	const FString PackageFileName = FPackageName::LongPackageNameToFilename(PackageName,
@@ -153,7 +169,7 @@ inline void SavePackage(UPackage* Package) {
 		SaveArgs.SaveFlags = SAVE_NoError;
 	}
 
-	UPackage::SavePackage(Package, nullptr, *PackageFileName, SaveArgs);
+	return UPackage::SavePackage(Package, nullptr, *PackageFileName, SaveArgs);
 #else
 	UPackage::SavePackage(Package, nullptr, RF_Standalone, *PackageFileName);
 #endif
@@ -164,7 +180,9 @@ inline void SavePackage(UPackage* Package) {
  * Only ever true of the asset somebody asked for. An import reaches through whatever the asset
  * references and builds those too, and jumping to each of them walks the asset registry over every
  * object in memory while the ones further up this same stack are still half built. */
-inline bool HandleAssetCreation(UObject* Asset, UPackage* Package, const bool bBrowse = true) {
+/* bPostEditChange off is for an importer that finishes the asset itself further on, so the asset is
+ * not rebuilt (for a material, compiled) once half made and again when whole */
+inline bool HandleAssetCreation(UObject* Asset, UPackage* Package, const bool bBrowse = true, const bool bPostEditChange = true) {
 	{
 		/* User Failsafe.... */
 		const UPackage* AssetOutermostPackage = Asset->GetOutermost();
@@ -194,7 +212,9 @@ inline bool HandleAssetCreation(UObject* Asset, UPackage* Package, const bool bB
 	 * never started is an assert rather than an answer. A commandlet has none, and nothing has the
 	 * old font cached there either. */
 	// Niagara effect types expect MemberProperty on the change event.
-	if (Asset->IsA<UNiagaraEffectType>()) {
+	if (!bPostEditChange) {
+		/* Finished by the importer, which calls PostEditChange once the asset is whole */
+	} else if (Asset->IsA<UNiagaraEffectType>()) {
 		if (FProperty* Settings = FindFProperty<FProperty>(Asset->GetClass(), TEXT("UpdateFrequency"))) {
 			FPropertyChangedEvent Change(Settings);
 			Asset->PostEditChangeProperty(Change);

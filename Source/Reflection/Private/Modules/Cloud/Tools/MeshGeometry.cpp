@@ -367,11 +367,22 @@ int32 TMeshGeometry::RebuildLodModels(USkeletalMesh* SkeletalMesh, const TShared
 
 		/* BuildLODModel skips a LOD it thinks was generated from a lower one, and an importer that
 		 * set this leaves the new source data unread. Cleared here, the same way a real build
-		 * clears it before running. */
+		 * clears it before running.
+		 *
+		 * Reduction goes off with it, whatever criterion the game's LOD was authored with. The LOD
+		 * written above is the game's own cooked geometry, and a reduction still active makes the
+		 * build throw it away and simplify the base LOD in its place: a LOD authored as "at most
+		 * 7500 vertices" (SMTC_AbsNumOfVerts) came out as the editor's own 7500-vertex reduction,
+		 * not the game's 7499, so nothing keyed to the game's vertices (skin weight profiles,
+		 * morph deltas, cloth) lined up with it. Percentages alone don't turn an absolute
+		 * criterion off, so the criterion and its limits are reset too. */
 		if (FSkeletalMeshLODInfo* LodInfo = SkeletalMesh->GetLODInfo(LodIndex)) {
 			LodInfo->bHasBeenSimplified = false;
+			LodInfo->ReductionSettings.TerminationCriterion = SMTC_NumOfTriangles;
 			LodInfo->ReductionSettings.NumOfTrianglesPercentage = 1.0f;
 			LodInfo->ReductionSettings.NumOfVertPercentage = 1.0f;
+			LodInfo->ReductionSettings.MaxNumOfTriangles = MAX_uint32;
+			LodInfo->ReductionSettings.MaxNumOfVerts = MAX_uint32;
 
 			/* The normals and tangents above are the game's own, per corner. Left on, the build
 			 * throws them away and works its own out of the triangles, which is not the shading

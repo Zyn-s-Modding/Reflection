@@ -24,6 +24,13 @@
 #include "Logging/LogVerbosity.h"
 #include "JsonGlobals.h"
 #include "Settings/Runtime.h"
+
+#if UE5_1_BEYOND
+#include "Editor.h"
+#include "Importers/Types/Niagara/NiagaraEmitterImporter.h"
+#include "Misc/CoreDelegates.h"
+#include "Subsystems/AssetEditorSubsystem.h"
+#endif
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 
 #ifdef _MSC_VER
@@ -84,9 +91,35 @@ void FReflectionModule::StartupModule() {
 	GReflectionRuntime.Update();
 
 	FReflectionSupport::Register();
+
+#if UE5_1_BEYOND
+	if (!IsRunningCommandlet()) {
+		RegisterNiagaraRepair();
+		if (!NiagaraEditorOpen.IsValid()) {
+			NiagaraEditorInit = FCoreDelegates::OnPostEngineInit.AddRaw(this, &FReflectionModule::RegisterNiagaraRepair);
+		}
+	}
+#endif
 }
 
+#if UE5_1_BEYOND
+void FReflectionModule::RegisterNiagaraRepair() {
+	if (GEditor == nullptr || NiagaraEditorOpen.IsValid()) return;
+	if (UAssetEditorSubsystem* AssetEditor = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()) {
+		NiagaraEditorOpen = AssetEditor->OnAssetEditorRequestedOpen().AddStatic(&INiagaraEmitterImporter::RepairSavedScripts);
+	}
+}
+#endif
+
 void FReflectionModule::ShutdownModule() {
+#if UE5_1_BEYOND
+	FCoreDelegates::OnPostEngineInit.Remove(NiagaraEditorInit);
+	if (GEditor != nullptr && NiagaraEditorOpen.IsValid()) {
+		if (UAssetEditorSubsystem* AssetEditor = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()) {
+			AssetEditor->OnAssetEditorRequestedOpen().Remove(NiagaraEditorOpen);
+		}
+	}
+#endif
 	/* Unregister startup callback and tool menus */
 #if !UE4_23_BELOW
 	UToolMenus::UnRegisterStartupCallback(this);

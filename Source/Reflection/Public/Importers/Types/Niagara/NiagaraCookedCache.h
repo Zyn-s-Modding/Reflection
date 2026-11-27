@@ -24,4 +24,22 @@ class REFLECTION_API FNiagaraCookedCache {
 public:
 	/* Answers with the number of fields moved back */
 	static int32 Restore(FUObjectExportContainer* Container);
+
+	/* Renderer attribute bindings and sprite cutout, in the newer layout, onto this engine's.
+	 *
+	 * A renderer reads a particle attribute through a binding, and this engine's binding keeps the
+	 * attribute it was pointed at as RootVariable: everything else in it (ParamMapVariable,
+	 * DataSetName) is worked out from that again whenever the emitter is set up. Newer engines keep
+	 * the same thing as RootName, a name with no type, and this engine has no field of that name, so
+	 * the import left RootVariable at its default. The binding still read right until the emitter
+	 * was set up, then fell back to the default attribute: a flare sized by Particles.LightSize was
+	 * drawn at Particles.SpriteSize, a smoke flipbook lost its SubUV frame index, a glow its
+	 * orientation and dynamic material values. RootName is put into RootVariable, typed as the
+	 * binding's ParamMapVariable.
+	 *
+	 * And CutoutMode (Material / Texture / None), which this engine says as bUseMaterialCutoutTexture
+	 * beside CutoutTexture.
+	 *
+	 * Answers with the number of bindings restored. */
+	static int32 RestoreRendererBindings(FUObjectExportContainer* Container);
 };

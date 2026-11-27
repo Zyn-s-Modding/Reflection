@@ -59,7 +59,7 @@ UObject* IBlueprintImporter::CreateAsset(UObject* CreatedAsset) {
 	}
 
 	/* There by name and not by anything else: building on an unfinished parent asserts as the default object is made */
-	if (!ClassIsFormed(Class)) {
+	if (!ClassIsFormed(Class) || Class->IsChildOf(UStruct::StaticClass())) {
 		FImportIssues::Report(
 			EImportIssue::MissingClass,
 			FString::Printf(TEXT("Nothing was made of the parent class %s"), *Class->GetName()),
@@ -103,7 +103,7 @@ UObject* IBlueprintImporter::CreateAsset(UObject* CreatedAsset) {
 			);
 
 	/* Propagate blueprint defaults if it already exists */
-	if (UBlueprint* ExistingBlueprint = LoadObject<UBlueprint>(nullptr, *GetPackage()->GetPathName())) {
+	if (UBlueprint* ExistingBlueprint = LoadObjectByPath<UBlueprint>(GetPackage()->GetName() + TEXT(".") + GetAssetName())) {
 		/* A blueprint first made without its parent is built on the nearest class that was found, and
 		 * nothing looks again, so it is reparented here the way the editor's own reparent does it. Only
 		 * ever downwards, since a parent missing this time comes back as that same nearer class. */

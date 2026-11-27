@@ -33,17 +33,18 @@ void IImporter::Save() const {
 
 	/* User option to save packages on import */
 	if (Settings->AssetSettings.SaveAssets) {
-		SavePackage(GetPackage());
+		/* Written once the outermost import is done, see FAssetUtilities::QueueSave */
+		FAssetUtilities::QueueSave(GetPackage());
 	}
 }
 
-bool IImporter::OnAssetCreation(UObject* Asset) const {
+bool IImporter::OnAssetCreation(UObject* Asset, const bool bFinishedLater) const {
 	Validate(Asset);
 
 	/* Jumped to only when nothing is waiting on this one. A reference met partway through another
 	 * import is built by a nested run, and the browser has no business following it. */
-	const bool Synced = HandleAssetCreation(Asset, GetPackage(), FAssetUtilities::ImportDepth <= 1);
-	if (Synced) {
+	const bool Synced = HandleAssetCreation(Asset, GetPackage(), FAssetUtilities::ImportDepth <= 1, !bFinishedLater);
+	if (Synced && !bFinishedLater) {
 		Save();
 	}
 	

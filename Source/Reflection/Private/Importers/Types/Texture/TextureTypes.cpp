@@ -27,6 +27,14 @@ bool FTextureTypes::HasPixelPayload(const FString& Type) {
 	return Type != TEXT("TextureRenderTarget2D");
 }
 
+const TCHAR* FTextureTypes::PixelContentType(const FString& Type, const TSharedPtr<FJsonObject>& Export) {
+	if (Type == TEXT("VolumeTexture")) {
+		return VolumeSourceContentType;
+	}
+
+	return RequiresRawMipData(Type, IsVectorDisplacementMap(Export)) ? TEXT("application/octet-stream") : TEXT("image/png");
+}
+
 bool FTextureTypes::RequiresRawMipData(const FString& Type, const bool bIsVectorDisplacementMap) {
 #if !PLATFORM_WINDOWS
 	// Use encoded images on platforms without the raw texture decoders.

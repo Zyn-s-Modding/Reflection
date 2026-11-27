@@ -10,6 +10,7 @@
 #include "Engine/EngineUtilities.h"
 #include "Engine/Log.h"
 #include "Modules/Cloud/Cloud.h"
+#include "RenderingThread.h"
 #include "Settings/ReflectionSettings.h"
 #include "Utilities/ContentBrowser.h"
 
@@ -34,9 +35,7 @@ bool ITextureImporter<AssetType>::Import() {
 
 /* The pixels come from the export endpoint too, with the content type of the request picking the
  * encoding: an image the texture factory can take, or the raw bytes of the first mip. */
-static bool DownloadPixels(const FString& FetchPath, const FString& Type, const TSharedPtr<FJsonObject>& Export, TArray<uint8>& OutData) {
-	const bool UseRawMipData = FTextureTypes::RequiresRawMipData(Type, FTextureTypes::IsVectorDisplacementMap(Export));
-
+static bool DownloadPixels(const FString& FetchPath, const FString& Type, const TSharedPtr<FJsonObject>& Export, TArray<uint8>& OutData, FString& OutContentType) {
 	/* Which export of the package is wanted, said outright.
 	 *
 	 * The Cloud reads a path as far as the first dot and no further, so a name written on the end of
@@ -48,7 +47,9 @@ static bool DownloadPixels(const FString& FetchPath, const FString& Type, const 
 	Export->TryGetStringField(TEXT("Name"), Named);
 
 	/* Asked through the Cloud so the query is encoded, a + written out reads as a space */
-	return Cloud::Export::GetBinaryBlocking(FetchPath, UseRawMipData ? TEXT("application/octet-stream") : TEXT("image/png"), OutData, Named);
+	const FString Requested = FTextureTypes::PixelContentType(Type, Export);
+	return Cloud::Export::GetBinaryBlocking(FetchPath, Requested, OutData, Named, &OutContentType)
+		&& (Requested != FTextureTypes::VolumeSourceContentType || OutContentType == Requested || OutContentType == TEXT("application/octet-stream"));
 }
 
 bool FTextureImport::FromCloud(const FString& Path, const FString& FetchPath, UTexture*& OutTexture) {
@@ -56,15 +57,19 @@ bool FTextureImport::FromCloud(const FString& Path, const FString& FetchPath, UT
 		return false;
 	}
 
-	const TSharedPtr<FJsonObject> Response = Cloud::Export::GetRawBlocking(FetchPath);
-	if (Response == nullptr) {
+	return FromResponse(Cloud::Export::GetRawBlocking(FetchPath), Path, FetchPath, OutTexture);
+}
+
+bool FTextureImport::FromResponse(const TSharedPtr<FJsonObject>& Response, const FString& Path, const FString& FetchPath, UTexture*& OutTexture) {
+	if (Path.IsEmpty() || Response == nullptr) {
 		return false;
 	}
 
-	const TArray<TSharedPtr<FJsonValue>> Exports = Response->GetArrayField(TEXT("exports"));
-	if (Exports.Num() == 0) {
+	const TArray<TSharedPtr<FJsonValue>>* ExportList = nullptr;
+	if (!Response->TryGetArrayField(TEXT("exports"), ExportList) || ExportList->Num() == 0) {
 		return false;
 	}
+	const TArray<TSharedPtr<FJsonValue>>& Exports = *ExportList;
 
 	/* Which of the package's exports is the one wanted.
 	 *
@@ -110,15 +115,17 @@ bool FTextureImport::FromCloud(const FString& Path, const FString& FetchPath, UT
 	const FString Type = Export->GetStringField(TEXT("Type"));
 
 	TArray<uint8> Data;
+	FString ContentType;
 
-	if (FTextureTypes::HasPixelPayload(Type) && !DownloadPixels(FetchPath, Type, Export, Data)) {
+	if (FTextureTypes::HasPixelPayload(Type) && !DownloadPixels(FetchPath, Type, Export, Data, ContentType)) {
+		UE_LOG(LogReflection, Error, TEXT("Could not download %s pixels for \"%s\""), *Type, *FetchPath);
 		return false;
 	}
 
-	return FromExport(Export, Path, Type, Data, OutTexture);
+	return FromExport(Export, Path, Type, MoveTemp(Data), OutTexture, ContentType == FTextureTypes::VolumeSourceContentType);
 }
 
-bool FTextureImport::FromExport(const TSharedPtr<FJsonObject>& Export, const FString& Path, const FString& Type, TArray<uint8> Data, UTexture*& OutTexture) {
+bool FTextureImport::FromExport(const TSharedPtr<FJsonObject>& Export, const FString& Path, const FString& Type, TArray<uint8> Data, UTexture*& OutTexture, const bool bVolumeSource) {
 	const UReflectionSettings* Settings = GetSettings();
 
 	FString PackagePath;
@@ -152,27 +159,31 @@ bool FTextureImport::FromExport(const TSharedPtr<FJsonObject>& Export, const FSt
 
 	FTextureCreator TextureCreator = FTextureCreator(AssetName, Path, Package, UseRawMipData);
 
+	const bool bReplacingTexture = FindObjectFast<UTexture>(Package, FName(*AssetName)) != nullptr;
 	UTexture* Texture = nullptr;
-	if (!TextureCreator.Create(Type, Export, Data, Texture) || Texture == nullptr) {
+	if (!TextureCreator.Create(Type, Export, Data, Texture, bVolumeSource) || Texture == nullptr) {
 		return false;
 	}
 
-	FAssetRegistryModule::AssetCreated(Texture);
 	if (!Texture->MarkPackageDirty()) {
 		return false;
 	}
 
 	Package->SetDirtyFlag(true);
 	Texture->PostEditChange();
+	if (bReplacingTexture) {
+		/* Materials already using the old resource may be drawn during the next Cloud wait. */
+		FlushRenderingCommands();
+	}
+	FAssetRegistryModule::AssetCreated(Texture);
 	Texture->AddToRoot();
-	Package->FullyLoad();
 
 	/* Textures don't go through HandleAssetCreation, so the jump to the asset has to happen here,
 	 * and only where nothing is waiting on it further up */
 	if (FAssetUtilities::ImportDepth <= 1) BrowseToAsset(Texture);
 
 	if (Settings->AssetSettings.SaveAssets) {
-		SavePackage(Package);
+		FAssetUtilities::QueueSave(Package);
 	}
 
 	OutTexture = Texture;

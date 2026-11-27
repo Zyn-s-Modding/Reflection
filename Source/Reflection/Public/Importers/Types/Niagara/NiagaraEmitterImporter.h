@@ -15,9 +15,13 @@
  * says what it is for, and that is what puts it in the right place. */
 class INiagaraEmitterImporter final : public IObjectImporter {
 public:
+	virtual bool Import() override;
+	virtual void Prepare(UObject* Asset) const override;
 	virtual void Repair(UObject* Asset) const override;
 
 	static void RestoreVersions(UObject* Asset, FUObjectExportContainer* Container);
+	static void InitializeRuntime(UObject* Asset);
+	static void RepairSavedScripts(UObject* Asset);
 
 	virtual void Validate(UObject* Asset) const override;
 };

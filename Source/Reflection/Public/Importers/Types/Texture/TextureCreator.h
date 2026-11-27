@@ -47,7 +47,7 @@ public:
 	}
 
 	/* Builds whichever texture class Type names, false when it names none of them */
-	bool Create(const FString& Type, const TSharedPtr<FJsonObject>& Export, TArray<uint8>& Data, UTexture*& OutTexture);
+	bool Create(const FString& Type, const TSharedPtr<FJsonObject>& Export, TArray<uint8>& Data, UTexture*& OutTexture, bool bVolumeSource);
 
 	/* Whether the payload holds raw mip bytes rather than an encoded image */
 	bool IsRawMipData() const;
@@ -65,7 +65,7 @@ private:
 	bool CreateTexture2DArray(UTexture*& OutTexture2DArray, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export);
 #endif
 	bool CreateTextureCube(UTexture*& OutTextureCube, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export);
-	bool CreateVolumeTexture(UTexture*& OutVolumeTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export);
+	bool CreateVolumeTexture(UTexture*& OutVolumeTexture, const TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export, bool bVolumeSource);
 	bool CreateRenderTarget2D(UTexture*& OutRenderTarget2D, const TSharedPtr<FJsonObject>& Export);
 
 	/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Source data ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
@@ -95,6 +95,7 @@ private:
 
 	/* Decodes the raw first mip, slice by slice, into the texture's source data */
 	bool BuildSourceFromRawMip(UTexture* Texture, const TArray<uint8>& Data, const FTextureCookedLayout& Cooked) const;
+	void ReportReducedMip(UTexture* Texture, const FTextureCookedLayout& Cooked, const FTextureCookedLayout& Mip) const;
 
 	/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Deserialization ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 

@@ -18,6 +18,13 @@
 #endif
 #include "GPUSkinPublicDefs.h"
 #include "Modules/Cloud/Cloud.h"
+#include "Importers/Constructor/ImportIssues.h"
+#include "Rendering/SkeletalMeshLODImporterData.h"
+#include "Settings/Redirector.h"
+#include "Rendering/SkeletalMeshLODRenderData.h"
+#include "Rendering/SkeletalMeshRenderData.h"
+#include "SkinnedAssetCompiler.h"
+#include "Engine/SkeletalMeshSampling.h"
 #include "Rendering/SkeletalMeshModel.h"
 #include "Rendering/SkeletalMeshLODModel.h"
 #endif
@@ -152,7 +159,16 @@ void TSkeletalMeshData::Process(UObject* Object, const TArray<TSharedPtr<FJsonVa
 			}), SkeletalMesh);
 
 			const int32 SectionsChanged = ApplySectionUserData(SkeletalMesh, JsonObject);
-			const int32 SkinWeightProfiles = ApplySkinWeightProfiles(SkeletalMesh);
+			/* The game's path for the mesh, from the export's own header: the mesh's path here is
+			 * wherever the redirects put it, and the Cloud has nothing there */
+			FString SourcePath;
+			if (JsonObject->TryGetStringField(TEXT("Package"), SourcePath) && !SourcePath.IsEmpty()) {
+				SourcePath += TEXT(".") + Name;
+			} else {
+				SourcePath = SkeletalMesh->GetPathName();
+				FRRedirects::Reverse(SourcePath);
+			}
+			const int32 SkinWeightProfiles = ApplySkinWeightProfiles(SkeletalMesh, SourcePath);
 
 			ReportSkinWeightProfiles(SkeletalMesh);
 
@@ -167,6 +183,8 @@ void TSkeletalMeshData::Process(UObject* Object, const TArray<TSharedPtr<FJsonVa
 
 				SkeletalMesh->PostEditChange();
 			}
+
+			RebuildSamplingData(SkeletalMesh);
 
 			BrowseToWhenFinished(SkeletalMesh);
 		}
@@ -251,12 +269,159 @@ int32 TSkeletalMeshData::ApplySectionUserData(USkeletalMesh* Mesh, const TShared
 #endif
 }
 
-int32 TSkeletalMeshData::ApplySkinWeightProfiles(USkeletalMesh* Mesh) {
+void TSkeletalMeshData::RebuildSamplingData(USkeletalMesh* Mesh) {
+#if WITH_EDITORONLY_DATA
+	/* Sampling data is built data: for each LOD a whole-mesh area-weighted triangle sampler, for each
+	 * named region its triangles, vertices, bones and sampler, all made from the mesh's triangles.
+	 * The samplers aren't properties, so the source's copy deserializes to empty ones, and the
+	 * triangles it indexes are the game's, which the rebuilt LODs needn't match one for one. So what
+	 * the properties left (the region definitions and the per-LOD uniform sampling switch, both
+	 * carried) is built again by the engine itself, against the mesh as it now is. */
+	if (Mesh == nullptr) return;
+#if WITH_EDITOR
+	TArray<USkinnedAsset*> Building{Mesh};
+	FSkinnedAssetCompilingManager::Get().FinishCompilation(Building);
+#endif
+	const FSkeletalMeshRenderData* Render = Mesh->GetResourceForRendering();
+	if (Render == nullptr || Render->LODRenderData.IsEmpty()) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("Skeletal mesh sampling data could not be rebuilt"),
+			FString::Printf(TEXT("%s has no render data to build it from"), *Mesh->GetName()));
+		return;
+	}
+
+	FSkeletalMeshSamplingInfo Sampling = Mesh->GetSamplingInfo();
+	Sampling.BuildRegions(Mesh);
+	Sampling.BuildWholeMesh(Mesh);
+	Mesh->SetSamplingInfo(Sampling);
+
+	int32 Uniform = 0;
+	int32 Sampled = 0;
+	const FSkeletalMeshSamplingBuiltData& Built = Mesh->GetSamplingInfo().GetBuiltData();
+	for (int32 Lod = 0; Lod < Built.WholeMeshBuiltData.Num(); ++Lod) {
+		const FSkeletalMeshLODInfo* Info = Mesh->GetLODInfo(Lod);
+		if (Info == nullptr || !Info->bSupportUniformlyDistributedSampling) continue;
+		Uniform++;
+		Sampled += Built.WholeMeshBuiltData[Lod].AreaWeightedTriangleSampler.GetNumEntries();
+	}
+	UE_LOG(LogReflection, Display, TEXT("\"%s\" sampling data rebuilt by the engine: %d LOD(s), %d with uniform sampling (%d triangle(s) in their samplers), %d region(s)"),
+		*Mesh->GetName(), Built.WholeMeshBuiltData.Num(), Uniform, Sampled, Built.RegionBuiltData.Num());
+#endif
+}
+
+void TSkeletalMeshData::WriteProfileToImportData(USkeletalMesh* Mesh, int32 LodIndex, FName ProfileName, int32 SourceVertices,
+	const TMap<int32, TArray<TPair<int32, float>>>& Influences) {
+#if UE4_27_AND_UE5 && WITH_EDITORONLY_DATA
+	/* The LOD model's profile is what the next build is made from only while nothing rebuilds the
+	 * LOD from its import data. A build that does (a LOD setting changed, the mesh reimported)
+	 * makes each profile again from the import data's alternate skinning, and a profile with none
+	 * is dropped ("the alternate skinning imported source data is not available"). So the profile
+	 * goes into the import data too: the LOD's own points, wedges and faces, with the influences of
+	 * the vertices it overrides replaced by its own. The import data was written one point per
+	 * cooked vertex, which is what the overrides name, so no mapping is needed here. */
+	if (Mesh->IsLODImportedDataEmpty(LodIndex)) return;
+
+	FSkeletalMeshImportData Base;
+	Mesh->LoadLODImportedData(LodIndex, Base);
+	if (Base.Points.Num() != SourceVertices) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("A skin weight profile could not be written into a LOD's import data"),
+			FString::Printf(TEXT("%s LOD%d: the import data has %d points against %d cooked vertices, so a rebuild from it may drop the profile"),
+				*ProfileName.ToString(), LodIndex, Base.Points.Num(), SourceVertices));
+		return;
+	}
+
+	/* Laid out the way an imported alternate mesh is: one point per position. The engine lines the
+	 * alternate skinning up with the LOD by matching positions (MatchVertexIndexUsingPosition) and
+	 * then needs every alternate point to have been matched; the import data has a point per
+	 * cooked vertex, so a seam leaves two points at one position, the match takes one, and the
+	 * other is looked for and not found (asserts in FLODUtilities::UpdateAlternateSkinWeights). So
+	 * points at the same position are one point here, the wedges point at it, and it takes the
+	 * weights of the vertices there: the profile's where the profile overrides any of them. Only
+	 * points a triangle uses come in, since the rest made no vertex to match. */
+	TBitArray<> Used(false, Base.Points.Num());
+	for (const SkeletalMeshImportData::FVertex& Wedge : Base.Wedges) {
+		if (Used.IsValidIndex(Wedge.VertexIndex)) Used[Wedge.VertexIndex] = true;
+	}
+
+	TMap<FVector3f, int32> PointAt;
+	TArray<int32> MergedOf;
+	MergedOf.Init(INDEX_NONE, Base.Points.Num());
+	TArray<int32> SourceOf;
+	for (int32 Point = 0; Point < Base.Points.Num(); ++Point) {
+		if (!Used[Point]) continue;
+		if (const int32* Merged = PointAt.Find(Base.Points[Point])) {
+			MergedOf[Point] = *Merged;
+			/* The merged point skins like the profile wherever the profile overrides one of them */
+			if (Influences.Contains(Point) && !Influences.Contains(SourceOf[*Merged])) SourceOf[*Merged] = Point;
+			continue;
+		}
+		MergedOf[Point] = SourceOf.Num();
+		PointAt.Add(Base.Points[Point], SourceOf.Num());
+		SourceOf.Add(Point);
+	}
+
+	FSkeletalMeshImportData Alternate = Base;
+	Alternate.AlternateInfluences.Empty();
+	Alternate.AlternateInfluenceProfileNames.Empty();
+	Alternate.MorphTargets.Empty();
+	Alternate.MorphTargetModifiedPoints.Empty();
+	Alternate.MorphTargetNames.Empty();
+	Alternate.Points.Reset(SourceOf.Num());
+	Alternate.PointToRawMap.Reset(SourceOf.Num());
+	for (int32 Merged = 0; Merged < SourceOf.Num(); ++Merged) {
+		Alternate.Points.Add(Base.Points[SourceOf[Merged]]);
+		Alternate.PointToRawMap.Add(Merged);
+	}
+	for (SkeletalMeshImportData::FVertex& Wedge : Alternate.Wedges) {
+		Wedge.VertexIndex = MergedOf.IsValidIndex(Wedge.VertexIndex) ? FMath::Max(MergedOf[Wedge.VertexIndex], 0) : 0;
+	}
+
+	TMap<int32, TArray<const SkeletalMeshImportData::FRawBoneInfluence*>> BaseInfluencesOf;
+	for (const SkeletalMeshImportData::FRawBoneInfluence& Influence : Base.Influences) {
+		BaseInfluencesOf.FindOrAdd(Influence.VertexIndex).Add(&Influence);
+	}
+
+	Alternate.Influences.Reset();
+	for (int32 Merged = 0; Merged < SourceOf.Num(); ++Merged) {
+		const int32 Point = SourceOf[Merged];
+		if (const TArray<TPair<int32, float>>* Override = Influences.Find(Point)) {
+			float Total = 0.0f;
+			for (const TPair<int32, float>& Each : *Override) Total += Each.Value;
+			if (Total > 0.0f) {
+				for (const TPair<int32, float>& Each : *Override) {
+					SkeletalMeshImportData::FRawBoneInfluence& Influence = Alternate.Influences.AddDefaulted_GetRef();
+					Influence.VertexIndex = Merged;
+					Influence.BoneIndex = Each.Key;
+					Influence.Weight = Each.Value / Total;
+				}
+				continue;
+			}
+		}
+		if (const auto* Own = BaseInfluencesOf.Find(Point)) {
+			for (const SkeletalMeshImportData::FRawBoneInfluence* Each : *Own) {
+				SkeletalMeshImportData::FRawBoneInfluence& Influence = Alternate.Influences.Add_GetRef(*Each);
+				Influence.VertexIndex = Merged;
+			}
+		}
+	}
+
+	const FString Name = ProfileName.ToString();
+	const int32 Existing = Base.AlternateInfluenceProfileNames.Find(Name);
+	if (Existing != INDEX_NONE && Base.AlternateInfluences.IsValidIndex(Existing)) {
+		Base.AlternateInfluences[Existing] = MoveTemp(Alternate);
+	} else {
+		Base.AlternateInfluences.Add(MoveTemp(Alternate));
+		Base.AlternateInfluenceProfileNames.Add(Name);
+	}
+	Mesh->SaveLODImportedData(LodIndex, Base);
+#endif
+}
+
+int32 TSkeletalMeshData::ApplySkinWeightProfiles(USkeletalMesh* Mesh, const FString& SourcePath) {
 #if UE4_27_AND_UE5 && WITH_EDITORONLY_DATA
 	FSkeletalMeshModel* ImportedModel = Mesh->GetImportedModel();
 	if (ImportedModel == nullptr) return 0;
 
-	const TArray<TSharedPtr<FJsonValue>> Profiles = Cloud::Export::GetSkinWeightsBlocking(Mesh->GetPathName());
+	const TArray<TSharedPtr<FJsonValue>> Profiles = Cloud::Export::GetSkinWeightsBlocking(SourcePath);
 	if (Profiles.Num() == 0) return 0;
 
 	const FReferenceSkeleton& RefSkeleton = Mesh->GetRefSkeleton();
@@ -282,14 +447,31 @@ int32 TSkeletalMeshData::ApplySkinWeightProfiles(USkeletalMesh* Mesh) {
 
 			FSkeletalMeshLODModel& LodModel = ImportedModel->LODModels[LodIndex];
 
-			/* Overrides are keyed by vertex index, so a different count cannot be lined up */
+			/* Overrides name cooked vertices. Each vertex the build made names the import point it
+			 * came from (MeshToImportVertexMap), and the points were written one per cooked vertex,
+			 * so that map says which cooked vertex every LOD vertex is: a build that reorders or
+			 * splits vertices (a seam made into two) still gets each one its cooked twin's weights.
+			 * Only where the map isn't whole are they lined up by index, which needs the counts to
+			 * agree. */
 			const int32 SourceVertices = Lod->GetIntegerField(TEXT("Vertices"));
-
-			if (SourceVertices != LodModel.NumVertices) {
-				UE_LOG(LogReflection, Warning, TEXT("Skin weight profile '%s' was cooked against %d vertices at LOD%d, and '%s' has %d there. Skipped, as the weights are keyed by vertex index."), *ProfileName.ToString(), SourceVertices, LodIndex, *Mesh->GetName(), LodModel.NumVertices);
-
+			TMap<int32, TArray<int32, TInlineAllocator<2>>> LodVerticesOf;
+			const bool bMapped = LodModel.MeshToImportVertexMap.Num() == static_cast<int32>(LodModel.NumVertices);
+			if (bMapped) {
+				for (int32 LodVertex = 0; LodVertex < LodModel.MeshToImportVertexMap.Num(); ++LodVertex) {
+					const int32 Cooked = LodModel.MeshToImportVertexMap[LodVertex];
+					if (Cooked >= 0 && Cooked < SourceVertices) LodVerticesOf.FindOrAdd(Cooked).Add(LodVertex);
+				}
+			} else if (SourceVertices != static_cast<int32>(LodModel.NumVertices)) {
+				UE_LOG(LogReflection, Warning, TEXT("Skin weight profile '%s' was cooked against %d vertices at LOD%d, and '%s' has %d there with no map back to them. Skipped, as the weights are keyed by vertex."), *ProfileName.ToString(), SourceVertices, LodIndex, *Mesh->GetName(), LodModel.NumVertices);
+				FImportIssues::Report(EImportIssue::Data, TEXT("Skin weight profiles could not be lined up with a LOD"),
+					FString::Printf(TEXT("%s LOD%d: %d cooked vertices, %d here, and no map between them"), *ProfileName.ToString(), LodIndex, SourceVertices, LodModel.NumVertices));
 				continue;
 			}
+			int32 UnmatchedVertices = 0;
+			TSet<FString> AddedBones;
+			/* The profile against the cooked vertices, skeleton bones and plain weights, for the
+			 * LOD's import data below */
+			TMap<int32, TArray<TPair<int32, float>>> SourceInfluences;
 
 			/* Bones travel as names: this mesh numbers its skeleton however it likes */
 			const TArray<TSharedPtr<FJsonValue>>* BoneNames;
@@ -328,23 +510,40 @@ int32 TSkeletalMeshData::ApplySkinWeightProfiles(USkeletalMesh* Mesh) {
 			int32 AppliedVertices = 0;
 
 			ProcessJsonArrayField(Lod, TEXT("Overrides"), [&](const TSharedPtr<FJsonObject>& Override) {
-				const int32 GlobalIndex = Override->GetIntegerField(TEXT("Vertex"));
-				if (!ProfileData.SkinWeights.IsValidIndex(GlobalIndex)) return;
+				const int32 CookedIndex = Override->GetIntegerField(TEXT("Vertex"));
+				if (const TArray<TSharedPtr<FJsonValue>>* SourceBones = nullptr, *SourceWeights = nullptr;
+					Override->TryGetArrayField(TEXT("Bones"), SourceBones) && Override->TryGetArrayField(TEXT("Weights"), SourceWeights)) {
+					TArray<TPair<int32, float>>& Into = SourceInfluences.FindOrAdd(CookedIndex);
+					for (int32 Index = 0; Index < SourceBones->Num() && Index < SourceWeights->Num(); ++Index) {
+						const int32 NameIndex = static_cast<int32>((*SourceBones)[Index]->AsNumber());
+						const float Weight = static_cast<float>((*SourceWeights)[Index]->AsNumber());
+						if (BoneIndices.IsValidIndex(NameIndex) && BoneIndices[NameIndex] != INDEX_NONE && Weight > 0.0f) Into.Emplace(BoneIndices[NameIndex], Weight);
+					}
+				}
+				TArray<int32, TInlineAllocator<2>> Targets;
+				if (!bMapped) Targets.Add(CookedIndex);
+				else if (const auto* Found = LodVerticesOf.Find(CookedIndex)) Targets = *Found;
+				if (Targets.IsEmpty()) {
+					UnmatchedVertices++;
+					return;
+				}
+				for (const int32 GlobalIndex : Targets) {
+				if (!ProfileData.SkinWeights.IsValidIndex(GlobalIndex)) continue;
 
 				const TArray<TSharedPtr<FJsonValue>>* Bones;
 				const TArray<TSharedPtr<FJsonValue>>* Weights;
 
-				if (!Override->TryGetArrayField(TEXT("Bones"), Bones)) return;
-				if (!Override->TryGetArrayField(TEXT("Weights"), Weights)) return;
+				if (!Override->TryGetArrayField(TEXT("Bones"), Bones)) continue;
+				if (!Override->TryGetArrayField(TEXT("Weights"), Weights)) continue;
 
 				/* Weights are stored against the section's bone list, not the skeleton */
 				int32 SectionIndex = INDEX_NONE;
 				int32 SectionVertexIndex = INDEX_NONE;
 
 				LodModel.GetSectionFromVertexIndex(GlobalIndex, SectionIndex, SectionVertexIndex);
-				if (!LodModel.Sections.IsValidIndex(SectionIndex)) return;
+				if (!LodModel.Sections.IsValidIndex(SectionIndex)) continue;
 
-				const FSkelMeshSection& Section = LodModel.Sections[SectionIndex];
+				FSkelMeshSection& Section = LodModel.Sections[SectionIndex];
 
 				FBoneIndexType InfluenceBones[MAX_TOTAL_INFLUENCES] = { };
 				float InfluenceWeights[MAX_TOTAL_INFLUENCES] = { };
@@ -359,9 +558,19 @@ int32 TSkeletalMeshData::ApplySkinWeightProfiles(USkeletalMesh* Mesh) {
 					const int32 BoneIndex = BoneIndices[NameIndex];
 					if (BoneIndex == INDEX_NONE) continue;
 
-					/* A bone the section never used has no slot, so drop it and renormalize */
-					const int32 BoneMapIndex = Section.BoneMap.IndexOfByKey(static_cast<FBoneIndexType>(BoneIndex));
-					if (BoneMapIndex == INDEX_NONE) continue;
+					/* A bone only the profile skins to has no slot in the section yet: the build made
+					 * the section's bone map from the base weights, and the game's map had the
+					 * profile's bones in it too. Given one here, the way the game's section had it,
+					 * rather than dropped, and the LOD is told it uses the bone (and its parents). */
+					int32 BoneMapIndex = Section.BoneMap.IndexOfByKey(static_cast<FBoneIndexType>(BoneIndex));
+					if (BoneMapIndex == INDEX_NONE) {
+						BoneMapIndex = Section.BoneMap.Add(static_cast<FBoneIndexType>(BoneIndex));
+						for (int32 Parent = BoneIndex; Parent != INDEX_NONE; Parent = RefSkeleton.GetParentIndex(Parent)) {
+							LodModel.ActiveBoneIndices.AddUnique(static_cast<FBoneIndexType>(Parent));
+							LodModel.RequiredBones.AddUnique(static_cast<FBoneIndexType>(Parent));
+						}
+						AddedBones.Add(RefSkeleton.GetBoneName(BoneIndex).ToString());
+					}
 
 					const float Weight = static_cast<float>((*Weights)[Index]->AsNumber());
 					if (Weight <= 0.0f) continue;
@@ -374,7 +583,7 @@ int32 TSkeletalMeshData::ApplySkinWeightProfiles(USkeletalMesh* Mesh) {
 				}
 
 				/* Nothing resolved, so the vertex keeps what it was seeded with */
-				if (Influence == 0 || TotalWeight <= 0.0f) return;
+				if (Influence == 0 || TotalWeight <= 0.0f) continue;
 
 				FRawSkinWeight& SkinWeight = ProfileData.SkinWeights[GlobalIndex];
 
@@ -396,7 +605,25 @@ int32 TSkeletalMeshData::ApplySkinWeightProfiles(USkeletalMesh* Mesh) {
 				}
 
 				AppliedVertices++;
+				}
 			});
+
+			if (AddedBones.Num() > 0) {
+				LodModel.ActiveBoneIndices.Sort();
+				LodModel.RequiredBones.Sort();
+				UE_LOG(LogReflection, Display, TEXT("Skin weight profile '%s' LOD%d skins to %d bone(s) the rebuilt sections didn't map, now added to them: %s"),
+					*ProfileName.ToString(), LodIndex, AddedBones.Num(), *FString::Join(AddedBones.Array(), TEXT(", ")));
+			}
+
+			if (UnmatchedVertices > 0) {
+				UE_LOG(LogReflection, Warning, TEXT("Skin weight profile '%s' LOD%d: %d overridden cooked vertex(es) have no vertex in '%s', so their weights went nowhere"), *ProfileName.ToString(), LodIndex, UnmatchedVertices, *Mesh->GetName());
+				FImportIssues::Report(EImportIssue::Data, TEXT("Some skin weight profile vertices matched no vertex here"),
+					FString::Printf(TEXT("%s LOD%d: %d cooked vertex(es)"), *ProfileName.ToString(), LodIndex, UnmatchedVertices));
+			}
+
+			if (AppliedVertices > 0) {
+				WriteProfileToImportData(Mesh, LodIndex, ProfileName, SourceVertices, SourceInfluences);
+			}
 
 			if (AppliedVertices == 0) {
 				LodModel.SkinWeightProfiles.Remove(ProfileName);

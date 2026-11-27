@@ -3,8 +3,11 @@
 #include "Serializers/Structs/FallbackStructSerializer.h"
 
 #include "Serializers/PropertySerializer.h"
+#include "Importers/Constructor/ImportIssues.h"
 
 void FFallbackStructSerializer::Deserialize(UScriptStruct* Struct, void* StructValue, const TSharedPtr<FJsonObject> JsonValue, UObject* OptionalOuter) {
+	if (JsonValue.IsValid()) FImportIssues::ReportUnplacedFields(Struct, *JsonValue);
+
 	for (FProperty* Property = Struct->PropertyLink; Property; Property = Property->PropertyLinkNext) {
 		FString PropertyName = Property->GetName();
 		FString ValueName = PropertyName;
@@ -74,6 +77,15 @@ void FFallbackStructSerializer::Deserialize(UScriptStruct* Struct, void* StructV
 			const bool bHasHandledProperty = PassthroughPropertyHandler(Property, PropertyName, PropertyValue, JsonValue, PropertySerializer);
 
 			if (!bHasHandledProperty) {
+				/* Called something else by the source (Resources/ReflectionFields.json) */
+				if (!JsonValue->HasField(ValueName)) {
+					if (const TSharedPtr<FJsonValue> Aliased = FImportIssues::AliasedValue(Struct, PropertyName, *JsonValue); Aliased.IsValid()) {
+						FJsonObject Renamed;
+						Renamed.SetField(ValueName, Aliased);
+						PropertySerializer->DeserializePropertyField(Property, Renamed, ValueName, StructValue, OptionalOuter);
+						continue;
+					}
+				}
 				PropertySerializer->DeserializePropertyField(Property, *JsonValue, ValueName, StructValue, OptionalOuter);
 			}
 		}

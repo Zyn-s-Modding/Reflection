@@ -39,6 +39,7 @@ struct FRigVMGraphStats {
 	/* Nodes the graph refused to take, and links it refused to make */
 	int32 FailedNodes = 0;
 	int32 FailedLinks = 0;
+	int32 SkippedCalls = 0;
 };
 
 /* Rebuilds a rig's graph out of the RigVM its graph was compiled into.
@@ -113,6 +114,8 @@ private:
 	};
 
 	void ReadMemory(const FUObjectJsonValueExport& VirtualMachine);
+	void ExpandCallables(const FUObjectJsonValueExport& ByteCode, TArray<FUObjectJsonValueExport>& Instructions,
+		TArray<FUObjectJsonValueExport>& BranchInfos, TArray<int32>& EntryInstructions);
 	void CollectNodes(const TArray<FUObjectJsonValueExport>& Instructions, const TArray<FString>& FunctionNames);
 
 	/* Gives every register to the pin it is named after, written pins first */
@@ -129,11 +132,11 @@ private:
 	/* Lays the graph out left to right: each node one column right of everything feeding it */
 	void UpdateLayout();
 
-	/* Turns collapsed graphs' local variables into rig variables so their first writer has a
-	 * source. Runs last: making a variable compiles the blueprint, which may collect garbage. */
+	/* Turns collapsed graphs' local variables into rig variables so their first writer has a source. */
 	void PromoteLocalVariables();
 	void CreateLinks(const TArray<FUObjectJsonValueExport>& Instructions);
-	void CreateExecution(const TArray<FUObjectJsonValueExport>& Instructions, const FUObjectJsonValueExport& ByteCode);
+	void CreateExecution(const TArray<FUObjectJsonValueExport>& Instructions, const TArray<FUObjectJsonValueExport>& BranchInfos,
+		const TArray<int32>& EntryInstructions);
 
 	/* The register a memory type and index name, or null when the export doesn't have one */
 	FRegister* FindRegister(int32 MemoryType, int32 RegisterIndex);

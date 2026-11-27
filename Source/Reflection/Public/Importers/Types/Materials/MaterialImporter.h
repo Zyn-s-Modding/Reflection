@@ -8,6 +8,10 @@ class IMaterialImporter final : public IMaterialGraph {
 public:
 	virtual UObject* CreateAsset(UObject* CreatedAsset) override;
 	virtual bool Import() override;
+
+private:
+	/* Rebuilt over a material the editor already had loaded, rather than made new */
+	bool bReplacingLoaded = false;
 };
 
 REGISTER_IMPORTER(IMaterialImporter, {

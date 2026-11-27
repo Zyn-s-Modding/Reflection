@@ -1273,6 +1273,22 @@ UEdGraphPin* FBytecodeGraph::PointAtDelegate(UK2Node_BaseMCDelegate* Node, const
 	return nullptr;
 }
 
+bool FBytecodeGraph::PrepareDelegate(UK2Node_BaseMCDelegate* Node, const FUObjectJsonValueExport& Named) {
+	UEdGraphPin* Target = PointAtDelegate(Node, Named);
+	const FMemberReference& Member = Node->DelegateReference;
+	const UClass* Owner = Member.GetMemberParentClass();
+	if (Owner != nullptr && Member.ResolveMember<FMulticastDelegateProperty>() == nullptr) {
+		Unhandled.AddUnique(FString::Printf(TEXT("dispatcher %s.%s is unavailable in this build"),
+			*Owner->GetName(), *Member.GetMemberName().ToString()));
+		Graph->RemoveNode(Node);
+		return false;
+	}
+
+	Node->AllocateDefaultPins();
+	AimDelegate(Node, Target);
+	return true;
+}
+
 UEdGraphPin* FBytecodeGraph::FindAnswer(const FString& Name) const {
 	if (Graph == nullptr || Name.IsEmpty()) return nullptr;
 
@@ -1569,67 +1585,17 @@ void FBytecodeGraph::BringInClass(const FUObjectJsonValueExport& Named) {
 	/* Already here, whether the project shipped with it or something earlier asked for it */
 	if (Kind.IsEmpty() || FindClassByType(Kind) != nullptr) return;
 
-	/* Named where the game kept it, which is not where the editor keeps it */
-	Where = ToEditorPackagePath(Where);
+	const FString SourcePackage = TToolImportFromPath::ToPackagePath(Where);
+	if (SourcePackage.IsEmpty()) return;
 
-	/* An export is named by its package and the number it sits at, and the number is no part of
-	 * where the editor keeps it. Only a number comes off: a path already ending in a name is the
-	 * same path either way. */
-	if (int32 Sits; Where.FindLastChar(TEXT('.'), Sits)) {
-		const FString After = Where.RightChop(Sits + 1);
-
-		if (!After.IsEmpty() && After.IsNumeric()) {
-			LeftInline(Where, Sits);
-		}
-	}
-
-	if (Where.IsEmpty()) return;
-
-	/* What is wanted is the asset, which goes by the name of the package it sits in, rather than
-	 * the default object the call happened to name */
-	FString Leaf = Where;
-
-	if (int32 Slash; Where.FindLastChar(TEXT('/'), Slash)) {
-		Leaf = Where.RightChop(Slash + 1);
-	}
-
-	if (Leaf.IsEmpty()) return;
-
-	const FString Whole = Where + TEXT(".") + Leaf;
-
-	/* Already in the project but not loaded. Nothing has asked for it yet in a run that loads only
-	 * what it is pointed at, and one that is told to leave references alone never goes and gets it
-	 * either, so a class sitting on disk would read as one the build has not got. */
-	if (FPackageName::DoesPackageExist(Where)) {
-		LoadObject<UObject>(nullptr, *Whole);
-
-		if (FindClassByType(Kind) != nullptr) {
-			UE_LOG(LogReflectionBytecode, Display, TEXT("\"%s\" was already in the project, and was loaded"), *Whole);
-
-			return;
-		}
-	}
-
-	/* One at a time, and never the one already on its way.
-	 *
-	 * Two blueprints can each call into the other, and each would be asked for while the other was
-	 * being read. Followed straight there is no bottom to it, so a package already coming is left
-	 * to arrive rather than asked for again. */
-	static TSet<FString> Fetching;
-
-	if (Fetching.Contains(Where)) return;
-
-	Fetching.Add(Where);
+	const FString OriginalPackage = ToEditorPackagePathDirect(SourcePackage);
+	const FString Destination = ToEditorPackagePath(SourcePackage);
+	if (LoadBlueprintClass(Destination) != nullptr || PackageHoldsAsset(Destination)) return;
 
 	TObjectPtr<UObject> Brought = nullptr;
 	bool bBrought = false;
-
-	FAssetUtilities::ConstructAsset<UObject>(Where, Whole, TEXT("BlueprintGeneratedClass"), Brought, bBrought);
-
-	Fetching.Remove(Where);
-
-	UE_LOG(LogReflectionBytecode, Display, TEXT("\"%s\" is called on and the project hasn't got it, so it was asked for: %s"),
-		*Whole, FindClassByType(Kind) != nullptr ? TEXT("here now") : TEXT("still not here"));
+	const FString OriginalObject = OriginalPackage + TEXT(".") + FPackageName::GetShortName(OriginalPackage);
+	FAssetUtilities::ConstructAsset<UObject>(SourcePackage, OriginalObject, TEXT("BlueprintGeneratedClass"), Brought, bBrought);
 }
 
 FString FBytecodeGraph::Canonical(const FUObjectJsonValueExport& Expression) {
@@ -1988,56 +1954,17 @@ FBytecodeGraph::FValue FBytecodeGraph::ReadExpression(const FUObjectJsonValueExp
 			return Value;
 		}
 
-		/* Named where the game kept it, which is not where the editor keeps it */
-		FString Where = Named.Has(TEXT("ObjectPath")) ? ToEditorPackagePath(Named.GetString(TEXT("ObjectPath"))) : FString();
-
-		/* The cloud names an export by the package it is in and the number it sits at, and the
-		 * number is no part of where the editor keeps it. Left on, the name is written after it and
-		 * the whole thing points at nothing. Only a number is taken off: a path that already ends
-		 * in the object's own name is the same path either way. */
-		if (int32 Sits; Where.FindLastChar(TEXT('.'), Sits)) {
-			const FString After = Where.RightChop(Sits + 1);
-
-			if (!After.IsEmpty() && After.IsNumeric()) {
-				LeftInline(Where, Sits);
-			}
+		const FString SourcePath = TToolImportFromPath::ToPackagePath(Named.GetString(TEXT("ObjectPath")));
+		if (SourcePath.IsEmpty()) {
+			Value.Literal = Called;
+			return Value;
 		}
 
-		Value.Literal = Where.IsEmpty() ? Called : Where + TEXT(".") + Called;
-
-		/* Brought in where the project hasn't got it.
-		 *
-		 * A reference written into the script names something the game had, and it is a reference
-		 * like any other: everything else an import reaches is fetched the same way. Left alone,
-		 * the pin points at nothing and the graph is quietly missing whatever it named.
-		 *
-		 * What kind of thing to ask for is taken from the reference itself rather than from the pin
-		 * that will hold it. A pin says the widest thing it will accept, which is not something that
-		 * can be fetched: a material pin takes any material interface, and no asset is one of those. */
-		if (!Value.Literal.IsEmpty() && LoadObjectByPath<UObject>(Value.Literal) == nullptr) {
-			FString Kind;
-
-			if (Named.Has(TEXT("ObjectName"))) {
-				Named.GetString(TEXT("ObjectName")).Split(TEXT("'"), &Kind, nullptr);
-			}
-
-			FString Package = Value.Literal;
-
-			if (int32 Sits; Package.FindLastChar(TEXT('.'), Sits)) {
-				LeftInline(Package, Sits);
-			}
-
-			if (!Kind.IsEmpty() && !Package.IsEmpty()) {
-				TObjectPtr<UObject> Brought = nullptr;
-				bool bBrought = false;
-
-				FAssetUtilities::ConstructAsset<UObject>(Package, Value.Literal, Kind, Brought, bBrought);
-
-				if (Brought == nullptr) {
-					UE_LOG(LogReflectionBytecode, Warning, TEXT("\"%s\" is a %s the project hasn't got and the cloud would not give"), *Value.Literal, *Kind);
-				}
-			}
-		}
+		// Resolve the original reference through the same importer as a serialized property.
+		TObjectPtr<UObject> Asset = nullptr;
+		IImporter Resolver;
+		Resolver.LoadExport(&Named.JsonObject, Asset);
+		Value.Literal = Asset != nullptr ? Asset->GetPathName() : ToEditorPackagePath(SourcePath) + TEXT(".") + Called;
 
 		return Value;
 	}
@@ -3363,6 +3290,8 @@ UK2Node* FBytecodeGraph::PlaceCall(const FUObjectJsonValueExport& Expression, UE
 		}
 	}
 
+	ImportedCalls.Add(Node);
+
 	ChainExecution(Node);
 
 	/* Kept where a call has nothing wired to it yet. One that takes nothing but constants is wired
@@ -3388,6 +3317,63 @@ UK2Node* FBytecodeGraph::PlaceCall(const FUObjectJsonValueExport& Expression, UE
 	Placed++;
 
 	return Node;
+}
+
+void FBytecodeGraph::RemoveCallsWithMissingInputs() {
+	const UBlueprint* Blueprint = Graph->GetTypedOuter<UBlueprint>();
+	const UClass* SelfClass = Blueprint != nullptr ? Blueprint->GeneratedClass : nullptr;
+	bool bRemovedCall;
+	do {
+		bRemovedCall = false;
+		for (UK2Node_CallFunction*& Call : ImportedCalls) {
+			const UFunction* Function = Call != nullptr ? Call->GetTargetFunction() : nullptr;
+			if (Function == nullptr) continue;
+
+			UEdGraphPin* Missing = nullptr;
+			for (UEdGraphPin* Pin : Call->Pins) {
+				if (Pin == nullptr || Pin->Direction != EGPD_Input || Pin->bHidden || Pin->bNotConnectable
+					|| Pin->LinkedTo.Num() > 0 || Pin->DefaultObject != nullptr) continue;
+
+				const UClass* Owner = Function->GetOwnerClass();
+				// Calls resolved against a Blueprint's skeleton can still target its generated class.
+				if (const UBlueprint* DeclaredBy = Owner != nullptr ? UBlueprint::GetBlueprintFromClass(Owner) : nullptr) {
+					if (DeclaredBy->GeneratedClass != nullptr) Owner = DeclaredBy->GeneratedClass;
+				}
+				const bool bMissingTarget = Pin->PinName == UEdGraphSchema_K2::PN_Self
+					&& !Function->HasAnyFunctionFlags(FUNC_Static) && Owner != nullptr && SelfClass != nullptr
+					&& !SelfClass->IsChildOf(Owner) && !SelfClass->ImplementsInterface(Owner);
+				const FProperty* Parameter = FindFProperty<FProperty>(Function, Pin->PinName);
+				if (bMissingTarget || (Parameter != nullptr && Parameter->HasAnyPropertyFlags(CPF_ReferenceParm)
+					&& !IsOptionalParameter(Function, Parameter))) {
+					Missing = Pin;
+					break;
+				}
+			}
+			if (Missing == nullptr) continue;
+
+			Unhandled.AddUnique(FString::Printf(TEXT("%s requires the missing input %s"),
+				*Function->GetName(), *Missing->PinName.ToString()));
+			UEdGraphPin* Before = WayIn(Call);
+			UEdGraphPin* After = Call->FindPin(UEdGraphSchema_K2::PN_Then, EGPD_Output);
+			const TArray<UEdGraphPin*> Incoming = Before != nullptr ? TArray<UEdGraphPin*>(Before->LinkedTo) : TArray<UEdGraphPin*>();
+			const TArray<UEdGraphPin*> Outgoing = After != nullptr ? TArray<UEdGraphPin*>(After->LinkedTo) : TArray<UEdGraphPin*>();
+			Call->BreakAllNodeLinks();
+			Graph->RemoveNode(Call);
+			for (UEdGraphPin* From : Incoming) {
+				for (UEdGraphPin* To : Outgoing) LinkExecution(From, To);
+			}
+			Call = nullptr;
+			bRemovedCall = true;
+		}
+	} while (bRemovedCall);
+
+	for (UK2Node_CreateDelegate* Node : CreatedDelegates) {
+		const UEdGraphPin* Output = Node->GetDelegateOutPin();
+		if (Output != nullptr && Output->LinkedTo.Num() == 0) {
+			Node->BreakAllNodeLinks();
+			Graph->RemoveNode(Node);
+		}
+	}
 }
 
 void FBytecodeGraph::ApplyLiteral(UEdGraphPin* Pin, const FString& Literal) {
@@ -3453,7 +3439,8 @@ void FBytecodeGraph::ApplyLiteral(UEdGraphPin* Pin, const FString& Literal) {
 				TObjectPtr<UObject> Brought = nullptr;
 				bool bBrought = false;
 
-				FAssetUtilities::ConstructAsset<UObject>(Package, Value, Takes->GetName(), Brought, bBrought);
+				const FString SourcePackage = ToCloudPackagePath(Package);
+				FAssetUtilities::ConstructAsset<UObject>(SourcePackage, Value, Takes->GetName(), Brought, bBrought);
 
 				Pointed = Brought;
 			}
@@ -4364,6 +4351,7 @@ bool FBytecodeGraph::Place(const FUObjectJsonValueExport& Statement) {
 	 * its own. Whoever binds it later reads that local, so the local stands for what this hands out. */
 	if (Token == TEXT("EX_BindDelegate")) {
 		UK2Node_CreateDelegate* Node = AddNode<UK2Node_CreateDelegate>();
+		CreatedDelegates.Add(Node);
 
 		Node->AllocateDefaultPins();
 
@@ -4406,11 +4394,7 @@ bool FBytecodeGraph::Place(const FUObjectJsonValueExport& Statement) {
 			? static_cast<UK2Node_BaseMCDelegate*>(AddNode<UK2Node_AddDelegate>())
 			: static_cast<UK2Node_BaseMCDelegate*>(AddNode<UK2Node_RemoveDelegate>());
 
-		UEdGraphPin* Against = PointAtDelegate(Node, Statement.GetObject(TEXT("MulticastDelegate")));
-
-		Node->AllocateDefaultPins();
-
-		AimDelegate(Node, Against);
+		if (!PrepareDelegate(Node, Statement.GetObject(TEXT("MulticastDelegate")))) return true;
 
 		if (Statement.Has(TEXT("Delegate"))) {
 			const FValue Bound = Read(Statement.GetObject(TEXT("Delegate")));
@@ -4429,11 +4413,7 @@ bool FBytecodeGraph::Place(const FUObjectJsonValueExport& Statement) {
 	if (Token == TEXT("EX_ClearMulticastDelegate")) {
 		UK2Node_ClearDelegate* Node = AddNode<UK2Node_ClearDelegate>();
 
-		UEdGraphPin* Against = PointAtDelegate(Node, Statement.GetObject(TEXT("DelegateToClear")));
-
-		Node->AllocateDefaultPins();
-
-		AimDelegate(Node, Against);
+		if (!PrepareDelegate(Node, Statement.GetObject(TEXT("DelegateToClear")))) return true;
 
 		ChainExecution(Node);
 
@@ -4446,11 +4426,7 @@ bool FBytecodeGraph::Place(const FUObjectJsonValueExport& Statement) {
 	if (Token == TEXT("EX_CallMulticastDelegate")) {
 		UK2Node_CallDelegate* Node = AddNode<UK2Node_CallDelegate>();
 
-		UEdGraphPin* Against = PointAtDelegate(Node, Statement.GetObject(TEXT("Delegate")));
-
-		Node->AllocateDefaultPins();
-
-		AimDelegate(Node, Against);
+		if (!PrepareDelegate(Node, Statement.GetObject(TEXT("Delegate")))) return true;
 
 		/* What it hands each of them, in the order the signature takes them */
 		const TArray<FUObjectJsonValueExport> Given = Statement.Has(TEXT("Parameters")) ? Statement.GetArray(TEXT("Parameters")) : TArray<FUObjectJsonValueExport>();
@@ -6473,6 +6449,8 @@ int32 FBytecodeGraph::Build() {
 	if (Contested.Num() > 0) {
 		UE_LOG(LogReflectionBytecode, Warning, TEXT("%d way(s) out were already spoken for: %s"), Contested.Num(), *FString::Join(Contested, TEXT(", ")));
 	}
+
+	RemoveCallsWithMissingInputs();
 
 	if (Unhandled.Num() > 0) {
 		UE_LOG(LogReflectionBytecode, Warning, TEXT("\"%s\" placed %d node(s), and read nothing from: %s"), *Graph->GetName(), Placed, *FString::Join(Unhandled, TEXT(", ")));

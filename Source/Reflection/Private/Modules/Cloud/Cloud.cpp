@@ -10,7 +10,11 @@
 #include "Settings/Runtime.h"
 #include "Engine/Log.h"
 #include "Engine/EngineUtilities.h"
+#include "Importers/Types/Texture/TextureTypes.h"
 #include "Modules/Cloud/Remote.h"
+#include "Modules/Cloud/BinaryJson.h"
+#include "Modules/Cloud/Prefetch.h"
+#include "HAL/IConsoleManager.h"
 
 /* Requests ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 FReflectionHttpRequest Cloud::BuildRequest(const FString& RequestURL, const TMap<FString, FString>& Parameters, const TMap<FString, FString>& Headers) {
@@ -48,12 +52,40 @@ FReflectionHttpRequest Cloud::BuildRequest(const FString& RequestURL, const TMap
 	return NewRequest;
 }
 
-TSharedPtr<FJsonObject> Cloud::ParseResponse(const FReflectionHttpResponse& Response) {
+namespace {
+	TAutoConsoleVariable<int32> CVarBinaryTransport(
+		TEXT("Reflection.Cloud.BinaryTransport"),
+		1,
+		TEXT("Ask Cloud to answer in Reflection Binary JSON rather than json where it can. 0 asks for json, as before.")
+	);
+}
+
+void Cloud::AcceptStructured(const FReflectionHttpRequest& Request) {
+	if (CVarBinaryTransport.GetValueOnAnyThread() == 0) return;
+
+	Request->SetHeader(TEXT("Accept"), FReflectionBinaryJson::AcceptHeader);
+}
+
+TSharedPtr<FJsonObject> Cloud::DecodeResponse(const FReflectionHttpResponse& Response) {
 	if (!Response.IsValid() || Response->GetResponseCode() != 200) {
 		return nullptr;
 	}
 
-	if (!Response->GetHeader(TEXT("Content-Type")).Contains(TEXT("json"))) {
+	const FString ContentType = Response->GetHeader(TEXT("Content-Type"));
+
+	if (FReflectionBinaryJson::IsContentType(ContentType)) {
+		const TArray<uint8>& Content = Response->GetContent();
+
+		const TSharedPtr<FJsonObject> Decoded = FReflectionBinaryJson::DecodeObject(Content.GetData(), Content.Num());
+
+		if (!Decoded.IsValid()) {
+			UE_LOG(LogReflection, Warning, TEXT("Cloud answered with Reflection Binary JSON that would not decode: \"%s\""), *Response->GetURL());
+		}
+
+		return Decoded;
+	}
+
+	if (!ContentType.Contains(TEXT("json"))) {
 		return nullptr;
 	}
 
@@ -67,6 +99,10 @@ TSharedPtr<FJsonObject> Cloud::ParseResponse(const FReflectionHttpResponse& Resp
 	return JsonObject;
 }
 
+TSharedPtr<FJsonObject> Cloud::ParseResponse(const FReflectionHttpResponse& Response) {
+	return DecodeResponse(Response);
+}
+
 void Cloud::Get(const FString& RequestURL,
 	const TMap<FString, FString>& Parameters,
 	const TMap<FString, FString>& Headers,
@@ -74,6 +110,7 @@ void Cloud::Get(const FString& RequestURL,
 {
 	const FReflectionHttpRequest Request = BuildRequest(RequestURL, Parameters, Headers);
 	Request->SetVerb(TEXT("GET"));
+	AcceptStructured(Request);
 
 	FRemoteUtilities::ExecuteRequestAsync(Request, [OnComplete](const FReflectionHttpResponse& Response) {
 		OnComplete(ParseResponse(Response));
@@ -89,6 +126,7 @@ void Cloud::Post(const FString& RequestURL,
 	Request->SetVerb(TEXT("POST"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetContentAsString(Body);
+	AcceptStructured(Request);
 
 	FRemoteUtilities::ExecuteRequestAsync(Request, [OnComplete](const FReflectionHttpResponse& Response) {
 		/* Zero tells the caller apart from a Cloud that answered but refused */
@@ -103,6 +141,7 @@ TSharedPtr<FJsonObject> Cloud::PostBlocking(const FString& RequestURL, const FSt
 	Request->SetVerb(TEXT("POST"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetContentAsString(Body);
+	AcceptStructured(Request);
 
 	const FReflectionHttpResponse Response = FRemoteUtilities::ExecuteRequestBlocking(Request);
 
@@ -117,6 +156,7 @@ TSharedPtr<FJsonObject> Cloud::PostBlocking(const FString& RequestURL, const FSt
 TSharedPtr<FJsonObject> Cloud::GetBlocking(const FString& RequestURL, const TMap<FString, FString>& Parameters, const TMap<FString, FString>& Headers) {
 	const FReflectionHttpRequest Request = BuildRequest(RequestURL, Parameters, Headers);
 	Request->SetVerb(TEXT("GET"));
+	AcceptStructured(Request);
 
 	return ParseResponse(FRemoteUtilities::ExecuteRequestBlocking(Request));
 }
@@ -181,6 +221,14 @@ TSharedPtr<FJsonObject> Cloud::Export::GetBlocking(const FString& Path, const bo
 }
 
 TSharedPtr<FJsonObject> Cloud::Export::GetRawBlocking(const FString& Path, const TMap<FString, FString>& Parameters, const TMap<FString, FString>& Headers) {
+	/* Already asked for by a run or an import further up, and quite likely already here. Only the
+	 * plain form is ever fetched ahead, so anything asking with more than the path asks itself. */
+	if (Parameters.Num() == 0 && Headers.Num() == 0) {
+		if (TSharedPtr<FJsonObject> Fetched; FCloudPrefetch::TakeRaw(Path, Fetched)) {
+			return Fetched;
+		}
+	}
+
 	return GetBlocking(Path, true, Parameters, Headers);
 }
 
@@ -368,28 +416,52 @@ TSharedPtr<FJsonObject> Cloud::Export::GetStaticMeshBlocking(const FString& Path
 	return Response;
 }
 
-bool Cloud::Export::GetBinaryBlocking(const FString& Path, const FString& ContentType, TArray<uint8>& OutData, const FString& Named) {
+bool Cloud::Export::GetBinaryBlocking(const FString& Path, const FString& ContentType, TArray<uint8>& OutData, const FString& Named, FString* OutContentType) {
+	/* A texture's pixels are asked for as soon as its export is in, since encoding them is the
+	 * slowest thing Cloud does */
+	if (bool bResult = false; FCloudPrefetch::TakeBinary(Path, ContentType, Named, OutData, bResult, OutContentType)) {
+		return bResult;
+	}
+
+	const FReflectionHttpResponse Response = FRemoteUtilities::ExecuteRequestBlocking(BuildBinaryRequest(Path, ContentType, Named));
+	return ReadBinaryResponse(Response, OutData, OutContentType);
+}
+
+FReflectionHttpRequest Cloud::Export::BuildBinaryRequest(const FString& Path, const FString& ContentType, const FString& Named) {
 	TMap<FString, FString> Parameters = { { TEXT("path"), Path } };
 
 	if (!Named.IsEmpty()) {
 		Parameters.Add(TEXT("export_name"), Named);
 	}
 
-	const FReflectionHttpRequest Request = BuildRequest(ExportURL, Parameters, { { TEXT("content-type"), ContentType } });
+	TMap<FString, FString> Headers = { { TEXT("Content-Type"), ContentType } };
+	if (ContentType == FTextureTypes::VolumeSourceContentType) {
+		/* Older Cloud versions answer this request with the original cooked mip. */
+		Headers[TEXT("Content-Type")] = TEXT("application/octet-stream");
+		Headers.Add(TEXT("Accept"), ContentType);
+	}
+
+	const FReflectionHttpRequest Request = BuildRequest(ExportURL, Parameters, Headers);
 	Request->SetVerb(TEXT("GET"));
+	return Request;
+}
 
-	const FReflectionHttpResponse Response = FRemoteUtilities::ExecuteRequestBlocking(Request);
-
+bool Cloud::Export::ReadBinaryResponse(const FReflectionHttpResponse& Response, TArray<uint8>& OutData, FString* OutContentType) {
 	if (!Response.IsValid() || Response->GetResponseCode() != 200) {
 		return false;
 	}
 
+	const FString ContentType = Response->GetContentType();
+
 	/* Json here means the Cloud has the export but couldn't hand back the payload for it */
-	if (Response->GetContentType().StartsWith(TEXT("application/json"))) {
+	if (ContentType.StartsWith(TEXT("application/json")) || FReflectionBinaryJson::IsContentType(ContentType)) {
 		return false;
 	}
 
 	OutData = Response->GetContent();
+	if (OutContentType != nullptr) {
+		*OutContentType = ContentType;
+	}
 
 	return OutData.Num() > 0;
 }
@@ -467,6 +539,10 @@ bool Cloud::EnsureMetadataBlocking() {
 	/* Long enough not to hammer a server that is still starting, short enough to feel immediate */
 	constexpr double BetweenTriesSeconds = 0.25;
 
+	/* A pinned build Mirror has but hasn't loaded answers "start it first" for as long as nobody
+	 * does, so the wait would never end. It is asked to load once, the way picking it does. */
+	bool bAskedToLoad = false;
+
 	for (;;) {
 		if (const TSharedPtr<FJsonObject> Response = GetBlocking(MetadataURL); Response.IsValid()) {
 			ApplyMetadata(Response);
@@ -474,6 +550,19 @@ bool Cloud::EnsureMetadataBlocking() {
 			if (!GReflectionRuntime.Profile.ProjectName.IsEmpty()) {
 				return true;
 			}
+		} else if (!Build.IsEmpty() && !bAskedToLoad) {
+			bAskedToLoad = true;
+			/* Mounting a whole build takes longer than a request is usually given, and Mirror stops
+			 * loading it when the asker hangs up, so this one waits as long as the load does */
+			const FReflectionHttpRequest Request = BuildRequest(BuildsURL + TEXT("/") + Build + TEXT("/start"), {}, {});
+			Request->SetVerb(TEXT("POST"));
+			Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+			Request->SetContentAsString(TEXT("{}"));
+			/* Past the project's HttpTimeout too, which would cut it at 30 seconds */
+			Request->SetTimeout(900.0f);
+			AcceptStructured(Request);
+			const FReflectionHttpResponse Started = FRemoteUtilities::ExecuteRequestBlocking(Request, 900.0f);
+			UE_LOG(LogReflection, Display, TEXT("Build %s wasn't loaded in Mirror, so it was asked to load it (%d)"), *Build, Started.IsValid() ? Started->GetResponseCode() : 0);
 		}
 
 		/* The wait is the reader's to end, which is what the dialog's Cancel is for */

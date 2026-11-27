@@ -52,6 +52,12 @@ void INiagaraParameterCollectionImporter::Repair(UObject* Asset) const {
 
 	if (Instance == nullptr) return;
 
+	/* The default instance can point back to the collection before the asset has a public path.
+	 * Restore that local reference before PostLoad synchronizes the saved parameter store. */
+	if (FObjectPropertyBase* Parent = FindFProperty<FObjectPropertyBase>(Instance->GetClass(), TEXT("Collection"))) {
+		Parent->SetObjectPropertyValue_InContainer(Instance, Collection);
+	}
+
 	FNiagaraParameterStore& Store = Instance->GetParameterStore();
 
 	/* Anything the instance came in holding, kept before the store is taken apart.

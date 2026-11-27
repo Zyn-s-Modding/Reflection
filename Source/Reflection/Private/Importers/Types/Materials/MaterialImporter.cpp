@@ -38,6 +38,8 @@ UObject* IMaterialImporter::CreateAsset(UObject* CreatedAsset) {
 	 * editor goes down on a render worker. The material already there is rebuilt in place instead,
 	 * with the render thread caught up first and the edit bracketed the way the engine expects. */
 	if (UMaterial* Existing = FindObject<UMaterial>(GetPackage(), *GetAssetName())) {
+		bReplacingLoaded = true;
+
 		FlushRenderingCommands();
 		Existing->PreEditChange(nullptr);
 
@@ -193,7 +195,8 @@ bool IMaterialImporter::Import() {
 	PruneMissingMaterialAttributes(Material, EditorOnlyData);
 
 	/* Handle edit changes, and add it to the content browser */
-	if (!OnAssetCreation(Material)) return false;
+	/* Compiled and saved once, at the end, when the graph is whole */
+	if (!OnAssetCreation(Material, true)) return false;
 
 	const TSharedPtr<FJsonObject>* ShadingModelsPtr;
 	
@@ -248,10 +251,20 @@ bool IMaterialImporter::Import() {
 	Material->UpdateCachedExpressionData();
 #endif
 
-	FMaterialUpdateContext MaterialUpdateContext;
+	/* A material only just made has nothing drawing with it, so there are no render states to take
+	 * down and build again. Doing it anyway walks every primitive in the editor's worlds. */
+	const uint32 UpdateOptions = bReplacingLoaded
+		? static_cast<uint32>(FMaterialUpdateContext::EOptions::Default)
+		: static_cast<uint32>(FMaterialUpdateContext::EOptions::Default & ~FMaterialUpdateContext::EOptions::RecreateRenderStates);
+
+	FMaterialUpdateContext MaterialUpdateContext(UpdateOptions);
 	MaterialUpdateContext.AddMaterial(Material);
-	
+
+	/* From 5.0 PostEditChange below updates the cached expression data and caches the shaders, which
+	 * is all ForceRecompileForRendering does, so calling both compiled every material twice */
+#if !ENGINE_UE5
 	Material->ForceRecompileForRendering();
+#endif
 
 	Material->PostEditChange();
 	Material->MarkPackageDirty();

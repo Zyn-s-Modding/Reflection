@@ -44,8 +44,34 @@ inline bool HasLiveContentBrowser() {
 	return false;
 }
 
+inline void BrowseToAsset(UObject* Asset);
+
+/* A synchronous batch only needs one browser sync, to the last asset it created. */
+class FScopedImportBrowse {
+public:
+	FScopedImportBrowse() : Previous(Active) { Active = this; }
+	~FScopedImportBrowse() {
+		Active = Previous;
+		BrowseToAsset(LastAsset.Get());
+	}
+
+	FScopedImportBrowse(const FScopedImportBrowse&) = delete;
+	FScopedImportBrowse& operator=(const FScopedImportBrowse&) = delete;
+
+private:
+	friend void BrowseToAsset(UObject* Asset);
+	static inline FScopedImportBrowse* Active = nullptr;
+	FScopedImportBrowse* Previous;
+	TWeakObjectPtr<UObject> LastAsset;
+};
+
 inline void BrowseToAsset(UObject* Asset) {
 	if (Asset == nullptr) {
+		return;
+	}
+
+	if (FScopedImportBrowse::Active != nullptr) {
+		FScopedImportBrowse::Active->LastAsset = Asset;
 		return;
 	}
 

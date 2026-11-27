@@ -42,7 +42,8 @@ bool IMaterialFunctionImporter::Import() {
 #endif
 
 	/* Handle edit changes, and add it to the content browser */
-	if (!OnAssetCreation(MaterialFunction)) return false;
+	/* Finished and saved once at the end, when its expressions are in */
+	if (!OnAssetCreation(MaterialFunction, true)) return false;
 
 	/* Define editor only data from the JSON */
 	FUObjectExportContainer* ExpressionContainer = new FUObjectExportContainer();
@@ -54,6 +55,10 @@ bool IMaterialFunctionImporter::Import() {
 	/* If Missing Material Data */
 	if (ExpressionContainer->Num() == 0) {
 		ReportMaterialDataMissing();
+
+		/* Kept as it was before the finish moved to the end: the empty function is still written */
+		MaterialFunction->PostEditChange();
+		Save();
 
 		return false;
 	}

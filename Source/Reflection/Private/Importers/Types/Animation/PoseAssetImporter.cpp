@@ -2,6 +2,7 @@
 
 #include "Importers/Types/Animation/PoseAssetImporter.h"
 #include "Animation/AnimSequence.h"
+#include "AssetToolsModule.h"
 #include "Animation/PoseAsset.h"
 #include "Engine/EngineUtilities.h"
 
@@ -149,11 +150,37 @@ namespace {
 }
 
 UObject* IPoseAssetImporter::CreateAsset(UObject* CreatedAsset) {
+	if (UObject* Existing = FindObject<UObject>(GetPackage(), *GetAssetName())) {
+		if (UPoseAsset* Pose = Cast<UPoseAsset>(Existing)) return IImporter::CreateAsset(Pose);
+
+		FImportIssues::Report(EImportIssue::Failed, TEXT("Pose asset name is already taken"), Existing->GetFullName());
+		return nullptr;
+	}
+
 	return IImporter::CreateAsset(NewObject<UPoseAsset>(GetPackage(), UPoseAsset::StaticClass(), *GetAssetName(), RF_Standalone | RF_Public));
+}
+
+UPackage* IPoseAssetImporter::CreateSourceAnimationPackage(const UPoseAsset& Pose, bool bReuseExisting, FString& OutName) {
+	const FString Folder = FPackageName::GetLongPackagePath(Pose.GetOutermost()->GetName());
+	const FString BaseName = Pose.GetName() + TEXT("_Pose_Export");
+	if (UAnimSequence* Source = bReuseExisting ? static_cast<UAnimSequence*>(Pose.SourceAnimation) : nullptr) {
+		const FString Name = Source->GetName();
+		const FString Suffix = Name.Mid(BaseName.Len());
+		if (Name.StartsWith(BaseName) && (Suffix.IsEmpty() || Suffix.IsNumeric() || (Suffix.StartsWith(TEXT("_")) && Suffix.Mid(1).IsNumeric()))
+			&& Source->GetOutermost()->GetName() == Folder / Name) {
+			OutName = Name;
+			return Source->GetOutermost();
+		}
+	}
+
+	FString PackagePath;
+	FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get().CreateUniqueAssetName(Folder / BaseName, FString(), PackagePath, OutName);
+	return FAssetUtilities::CreateAssetPackage(PackagePath);
 }
 
 bool IPoseAssetImporter::Import() {
 	PoseAsset = Create<UPoseAsset>();
+	if (PoseAsset == nullptr) return false;
 
 	/* Set Skeleton, so we can use it in the de-cooking process */
 	GetObjectSerializer()->DeserializeObjectProperties(KeepPropertiesShared(GetAssetData(),
@@ -384,43 +411,20 @@ void IPoseAssetImporter::ReverseCookLocalSpacePose(USkeleton* Skeleton) {
 		Pose->SetArrayField(TEXT("SourceCurveData"), SourceCurveData);
 	}
 
-	FString CleanName = GetAssetName();
-
-	const FString PoseAssetPackagePath = GetPackage()->GetName();
-	const FString ParentPath = FPackageName::GetLongPackagePath(PoseAssetPackagePath);
-
-	if (GetAssetName().EndsWith(TEXT("_PoseAsset"))) {
-		CleanName.RemoveFromEnd(TEXT("_PoseAsset"));
-	} else {
-		CleanName = GetAssetName() + "_Pose_Export";
+	// A previous import may have saved the companion under the mesh's name.
+	// Keep that link until the mesh importer can move both assets safely.
+	FString LegacyName = GetAssetName();
+	if (const UAnimSequence* Source = PoseAsset->SourceAnimation; Source != nullptr
+		&& LegacyName.RemoveFromEnd(TEXT("_PoseAsset"))
+		&& Source->GetName() == LegacyName
+		&& Source->GetOutermost()->GetName() == FPackageName::GetLongPackagePath(GetPackage()->GetName()) / LegacyName) {
+		return;
 	}
 
-	const FString PotentialAnimSequencePath = ParentPath / CleanName;
-
-	/* Taken already, whether or not anything has been written out.
-	 *
-	 * Or taken in the game itself: "X_PoseAsset" sits beside the mesh it was made for, and that mesh is usually
-	 * called "X". Here or not yet, the name is the mesh's, and an animation saved under it would stop the mesh from
-	 * ever being brought in. */
-	const TSharedPtr<FJsonObject> InTheGame = Cloud::Export::GetRawBlocking(ToCloudPackagePath(PotentialAnimSequencePath));
-
-	if (FPackageName::DoesPackageExist(PotentialAnimSequencePath)
-		|| FindObject<UObject>(nullptr, *(PotentialAnimSequencePath + TEXT(".") + CleanName)) != nullptr
-		/* Cloud answers a path it has nothing at with an error object, not with exports */
-		|| (InTheGame.IsValid() && InTheGame->HasField(TEXT("exports")))) {
-		CleanName = GetAssetName() + "_Pose_Export";
-	}
-	
-	const FString AnimSequencePackagePath = ParentPath / CleanName;
-
-	UPackage* AnimPackage = CreatePackage(
-		/* 4.25, 4.26.0 and below need an Outer */
-#if UE4_25_BELOW || (UE4_26_0)
-		nullptr,
-#endif
-		*AnimSequencePackagePath);
-
-	if (UAnimSequence* AnimSequence = CreateAnimSequenceFromPose(Skeleton, CleanName, PoseContainer, AnimPackage)) {
+	// The companion animation is generated from the pose asset. Its name is independent of the mesh.
+	FString SequenceName;
+	UPackage* AnimPackage = CreateSourceAnimationPackage(*PoseAsset, true, SequenceName);
+	if (UAnimSequence* AnimSequence = CreateAnimSequenceFromPose(Skeleton, SequenceName, PoseContainer, AnimPackage)) {
 		PoseAsset->SourceAnimation = AnimSequence;
 	}
 }
@@ -702,6 +706,10 @@ UAnimSequence* IPoseAssetImporter::CreateAnimSequenceFromPose(USkeleton* Skeleto
 		}
 	}
 
+	if (const UObject* Existing = FindObject<UObject>(Outer, *SequenceName); Existing != nullptr && !Existing->IsA<UAnimSequence>()) {
+		FImportIssues::Report(EImportIssue::Failed, TEXT("Generated pose animation name is already taken"), Existing->GetFullName());
+		return nullptr;
+	}
 	UAnimSequence* AnimSequence = NewObject<UAnimSequence>(Outer, FName(*SequenceName), RF_Public | RF_Standalone | RF_Transactional);
 	AnimSequence->SetSkeleton(Skeleton);
 

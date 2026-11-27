@@ -7,11 +7,15 @@
 #include "Importers/Types/Niagara/NiagaraEmitterImporter.h"
 #include "Importers/Types/Niagara/NiagaraGraphs.h"
 #include "Importers/Types/Niagara/NiagaraScriptImporter.h"
+#include "NiagaraStatelessFallback.h"
 #include "Importers/Types/Niagara/NiagaraVersions.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraScript.h"
 #include "NiagaraScriptSource.h"
 #include "NiagaraGraph.h"
+#if UE5_1_BEYOND
+#include "NiagaraSystemEditorData.h"
+#endif
 #if UE5_4_BEYOND
 #include "NiagaraSimulationStageBase.h"
 #endif
@@ -28,6 +32,59 @@ DEFINE_PRIVATE_MEMBER_ACCESSOR(FNiagaraResolveParameterStoreBindings, &UNiagaraS
 
 namespace {
 #if UE5_1_BEYOND
+	bool RestoreEmitterHandles(UNiagaraSystem* System, FUObjectExportContainer* Container) {
+		TArray<UNiagaraEmitter*> Owned;
+		for (FUObjectExport* Export : Container->Exports) {
+			if (UNiagaraEmitter* Emitter = Cast<UNiagaraEmitter>(Export->Object); Emitter != nullptr && Emitter->GetOuter() == System) {
+				Owned.Add(Emitter);
+			}
+		}
+
+		const FObjectPropertyBase* Stateless = FindFProperty<FObjectPropertyBase>(FNiagaraEmitterHandle::StaticStruct(), TEXT("StatelessEmitter"));
+		int32 Restored = 0;
+		TArray<FString> Missing;
+		for (FNiagaraEmitterHandle& Handle : System->GetEmitterHandles()) {
+			if (Stateless != nullptr && Stateless->GetObjectPropertyValue_InContainer(&Handle) != nullptr) continue;
+
+			FVersionedNiagaraEmitter& Instance = Handle.GetInstance();
+			if (Instance.Emitter == nullptr) {
+				const FName Name = Handle.GetName();
+				UNiagaraEmitter* Candidate = nullptr;
+				bool bAmbiguous = false;
+				for (UNiagaraEmitter* Emitter : Owned) {
+					if (Emitter->GetFName() == Name) {
+						Candidate = Emitter;
+						bAmbiguous = false;
+						break;
+					}
+					if (Emitter->GetFName().GetPlainNameString() != Name.ToString() && Emitter->GetUniqueEmitterName() != Name.ToString()) continue;
+					bAmbiguous |= Candidate != nullptr;
+					Candidate = Emitter;
+				}
+				if (!bAmbiguous && Candidate != nullptr) {
+					Instance.Emitter = Candidate;
+					Restored++;
+				}
+			}
+
+			if (Instance.Emitter != nullptr && Handle.GetEmitterData() == nullptr) {
+				const FGuid Exposed = Instance.Emitter->GetExposedVersion().VersionGuid;
+				if (!Instance.Version.IsValid()) Instance.Version = Exposed;
+			}
+			if (Handle.GetEmitterData() == nullptr) Missing.Add(Handle.GetName().ToString());
+		}
+
+		if (Restored > 0) {
+			UE_LOG(LogReflection, Display, TEXT("\"%s\" restored %d emitter handle(s) from editor exports"), *System->GetName(), Restored);
+		}
+		if (Missing.Num() == 0) return true;
+
+		const FString Detail = FString::Join(Missing, TEXT(", "));
+		UE_LOG(LogReflection, Warning, TEXT("\"%s\" is missing Niagara emitter instances or revisions: %s"), *System->GetName(), *Detail);
+		FImportIssues::Report(EImportIssue::Data, TEXT("Niagara emitter instances or revisions are missing"), Detail);
+		return false;
+	}
+
 	void RestoreEmitterCompiledData(UNiagaraSystem* System, const TArray<TSharedPtr<FJsonValue>>& Entries,
 		UPropertySerializer* Serializer) {
 		UScriptStruct* Struct = FNiagaraEmitterCompiledData::StaticStruct();
@@ -55,17 +112,50 @@ namespace {
 }
 
 bool INiagaraSystemImporter::Import() {
-	return FNiagaraGraphs::HasSerializedPins(GetContainer()) && IObjectImporter::Import();
+	if (!FNiagaraGraphs::HasSerializedPins(GetContainer())) return false;
+
+	UNiagaraSystem* System = Create<UNiagaraSystem>();
+	if (System == nullptr) return false;
+
+	FNiagaraGraphs::PrepareExports(*GetContainer(), *GetObjectSerializer());
+	DeserializeExports(System);
+	GetObjectSerializer()->DeserializeObjectProperties(GetAssetData(), System);
+	if (!RestoreSystem(System)) {
+		System->ClearFlags(RF_Public | RF_Standalone);
+		MoveToTransientPackageAndRename(System);
+		AssetExport->Object = nullptr;
+		return false;
+	}
+
+	RestorePreviewPlaybackRange(*System);
+	return OnAssetCreation(System);
 }
 
-void INiagaraSystemImporter::Repair(UObject* Asset) const {
-	UNiagaraSystem* System = Cast<UNiagaraSystem>(Asset);
+bool INiagaraSystemImporter::RestorePreviewPlaybackRange(UNiagaraSystem& System) {
+#if UE5_1_BEYOND && WITH_EDITORONLY_DATA
+	UNiagaraSystemEditorData* EditorData = Cast<UNiagaraSystemEditorData>(System.GetEditorData());
+	if (EditorData == nullptr) return false;
+
+	const TRange<float> Range = EditorData->GetPlaybackRange();
+	const float Start = Range.GetLowerBoundValue();
+	const float End = Range.GetUpperBoundValue();
+	if (FMath::IsFinite(Start) && FMath::IsFinite(End) && End > Start) return false;
+
+	// Cooked editor data can carry a zero-length range, which keeps the preview at its first frame.
+	EditorData->SetPlaybackRange(GetDefault<UNiagaraSystemEditorData>()->GetPlaybackRange());
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool INiagaraSystemImporter::RestoreSystem(UNiagaraSystem* System) const {
 	FUObjectExportContainer* Container = GetContainer();
-	if (System == nullptr || Container == nullptr) return;
+	if (Container == nullptr) return false;
 
 	FNiagaraCookedCache::Restore(Container);
-	FNiagaraGraphStats Stats;
-	FNiagaraGraphs::Rebuild(Container, GetPackage(), GetPropertySerializer(), Stats);
+	FNiagaraCookedCache::RestoreRendererBindings(Container);
+	FNiagaraGraphs::ReportMissingScriptVersions(*Container);
 
 	// Restore scripts first so the emitters can use their source references.
 	for (FUObjectExport* Export : Container->Exports) {
@@ -80,11 +170,32 @@ void INiagaraSystemImporter::Repair(UObject* Asset) const {
 		}
 	}
 
+	FNiagaraGraphStats Stats;
+	FNiagaraGraphs::Rebuild(Container, GetPackage(), GetPropertySerializer(), Stats);
+	for (FUObjectExport* Export : Container->Exports) {
+		if (UNiagaraScript* Script = Cast<UNiagaraScript>(Export->Object)) {
+			const TSharedPtr<FJsonObject>* Fields = nullptr;
+			const bool bInferUsage = !Export->JsonObject->TryGetObjectField(TEXT("Properties"), Fields) || !(*Fields)->HasField(TEXT("Usage"));
+			FNiagaraGraphs::RestoreOutputUsage(*Script, bInferUsage);
+		}
+	}
+
 #if UE5_1_BEYOND
+	bool bConvertedStateless = false;
+	if (!FNiagaraStatelessFallback::Convert(*System, *GetAssetData(), *Container, *GetObjectSerializer(), bConvertedStateless)) return false;
+	/* Again for the renderers the stateless conversion made or read in again */
+	FNiagaraCookedCache::RestoreRendererBindings(Container);
+	if (!RestoreEmitterHandles(System, Container)) return false;
+	for (FUObjectExport* Export : Container->Exports) {
+		if (UNiagaraEmitter* Emitter = Cast<UNiagaraEmitter>(Export->Object)) {
+			INiagaraEmitterImporter::InitializeRuntime(Emitter);
+		}
+	}
+
 	const TArray<TSharedPtr<FJsonValue>>* Compiled = nullptr;
-	if (AssetExport->JsonObject->TryGetArrayField(TEXT("EmitterCompiledStructs"), Compiled)) {
+	if (!bConvertedStateless && AssetExport->JsonObject->TryGetArrayField(TEXT("EmitterCompiledStructs"), Compiled)) {
 		RestoreEmitterCompiledData(System, *Compiled, GetPropertySerializer());
-	} else if (GetAssetData()->TryGetArrayField(TEXT("EmitterCompiledData"), Compiled)) {
+	} else if (!bConvertedStateless && GetAssetData()->TryGetArrayField(TEXT("EmitterCompiledData"), Compiled)) {
 		RestoreEmitterCompiledData(System, *Compiled, GetPropertySerializer());
 	}
 #endif
@@ -99,7 +210,7 @@ void INiagaraSystemImporter::Repair(UObject* Asset) const {
 	UNiagaraScript* Update = System->GetSystemUpdateScript();
 	if (Spawn == nullptr || Update == nullptr) {
 		FImportIssues::Report(EImportIssue::Data, TEXT("Niagara system is missing its spawn or update script"));
-		return;
+		return false;
 	}
 
 	// The two system scripts reference the same graph, which may be owned by either script.
@@ -110,6 +221,8 @@ void INiagaraSystemImporter::Repair(UObject* Asset) const {
 	}
 	if (Spawn->GetLatestSource() == nullptr) Spawn->SetLatestSource(Source);
 	if (Update->GetLatestSource() == nullptr) Update->SetLatestSource(Source);
+	FNiagaraGraphs::RestoreOutputUsage(*Spawn);
+	FNiagaraGraphs::RestoreOutputUsage(*Update);
 
 	UNiagaraScriptSource* GraphSource = Cast<UNiagaraScriptSource>(Source);
 	if (GraphSource == nullptr || GraphSource->NodeGraph == nullptr || Spawn->GetLatestSource() != Update->GetLatestSource()) {
@@ -165,7 +278,65 @@ void INiagaraSystemImporter::Repair(UObject* Asset) const {
 	}
 	if (!bCanResolve) {
 		FImportIssues::Report(EImportIssue::Data, TEXT("Niagara emitter is missing a compiled script"));
-		return;
+		return false;
+	}
+
+	/* The compiled data the game cooked says what each script reads and in what order, and some
+	 * of it can be of types this engine doesn't have (a data interface a later engine added). The
+	 * engine builds each script's parameter store from that data as the system loads, and an entry
+	 * of no type is taken for a plain value: its byte offset is then used as an index into the
+	 * data interfaces, which asserts (Array index out of bounds, in
+	 * FNiagaraScriptExecutionParameterStore::AddScriptParams) and takes the editor down. Compiled
+	 * data like that is thrown away. The scripts compile again from their graphs on save anyway,
+	 * and the graphs have had those types taken out. */
+	TArray<FString> Discarded;
+	for (FUObjectExport* Export : Container->Exports) {
+		UNiagaraScript* Cooked = Cast<UNiagaraScript>(Export->Object);
+		if (Cooked == nullptr) continue;
+		const FNiagaraVMExecutableData& CookedData = Cooked->GetVMExecutableData();
+		bool bUnknown = CookedData.DataInterfaceInfo.Num() != Cooked->GetCachedDefaultDataInterfaces().Num()
+			|| CookedData.UObjectInfos.Num() != Cooked->GetCachedDefaultUObjects().Num();
+		for (const FNiagaraScriptDataInterfaceCompileInfo& Info : CookedData.DataInterfaceInfo) {
+			bUnknown |= !Info.Type.IsValid() || Info.Type.GetClass() == nullptr;
+		}
+		for (const FNiagaraVariable& Parameter : CookedData.Parameters.Parameters) {
+			bUnknown |= !Parameter.GetType().IsValid();
+		}
+		for (const FNiagaraScriptDataInterfaceInfo& Cached : Cooked->GetCachedDefaultDataInterfaces()) {
+			bUnknown |= Cached.DataInterface == nullptr;
+		}
+		if (!bUnknown) continue;
+		Cooked->InvalidateCompileResults(TEXT("compiled data names types this engine doesn't have"));
+		Discarded.Add(Cooked->GetName());
+	}
+	if (Discarded.Num() > 0) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("Cooked Niagara compile results named types this engine doesn't have and were discarded"),
+			FString::Printf(TEXT("%s. These scripts are compiled again from their graphs"), *FString::Join(Discarded, TEXT(", "))));
+	}
+
+	/* The system compiles when it is saved, and a GPU emitter whose compute script comes out of
+	 * that compile without a base compile hash fails a check in FNiagaraShaderScript::SetScript,
+	 * which takes the editor down mid-save. The hash is the graph's entry for the GPU usage, which
+	 * the engine always files under the empty usage ID and builds from the particle spawn output.
+	 * Checked here so such a system is refused and said, rather than saved and crashed on. */
+	TArray<FString> Uncompilable;
+	for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles()) {
+		const FVersionedNiagaraEmitterData* Data = Handle.GetEmitterData();
+		if (Data == nullptr || Data->SimTarget != ENiagaraSimTarget::GPUComputeSim) continue;
+
+		const UNiagaraScript* Compute = Data->GetGPUComputeScript();
+		const UNiagaraScriptSource* ComputeSource = Compute != nullptr ? Cast<UNiagaraScriptSource>(Compute->GetLatestSource()) : nullptr;
+		const TCHAR* Why = nullptr;
+		if (Compute == nullptr) Why = TEXT("has no GPU compute script");
+		else if (Compute->GetUsageId().IsValid()) Why = TEXT("has a GPU compute script under a usage ID the engine never compiles it as");
+		else if (ComputeSource == nullptr || ComputeSource->NodeGraph == nullptr) Why = TEXT("has a GPU compute script with no graph");
+		else if (ComputeSource->NodeGraph->FindEquivalentOutputNode(ENiagaraScriptUsage::ParticleSpawnScript) == nullptr) Why = TEXT("has no particle spawn output to build the GPU compile hash from");
+		if (Why != nullptr) Uncompilable.Add(Handle.GetName().ToString() + TEXT(" ") + Why);
+	}
+	if (Uncompilable.Num() > 0) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("A GPU Niagara emitter would fail its shader compile on save"),
+			FString::Join(Uncompilable, TEXT("; ")) + TEXT(". The system was not saved, since saving it would crash the editor."));
+		return false;
 	}
 	FNiagaraResolveParameterStoreBindings::Access(System);
 #endif
@@ -187,10 +358,6 @@ void INiagaraSystemImporter::Repair(UObject* Asset) const {
 			for (const FNiagaraVersion& Version : FNiagaraVersions::All(Emitter)) {
 				if (Version.Struct != FVersionedNiagaraEmitterData::StaticStruct()) continue;
 				auto* Data = static_cast<FVersionedNiagaraEmitterData*>(Version.Data);
-#if STATS
-				// Imported emitter subobjects bypass UNiagaraEmitter::PostLoad.
-				Data->GetStatData().Init();
-#endif
 				if (Data->VersionedParent.Emitter == nullptr) continue;
 				Parents.Add({Data, Data->VersionedParent});
 				Data->VersionedParent = FVersionedNiagaraEmitter();
@@ -199,6 +366,14 @@ void INiagaraSystemImporter::Repair(UObject* Asset) const {
 		for (UNiagaraEmitter* Emitter : Emitters) Emitter->UpdateEmitterAfterLoad();
 #endif
 		System->UpdateSystemAfterLoad();
+#if UE5_1_BEYOND
+		if (bConvertedStateless) {
+			if (UNiagaraSystemEditorData* EditorData = Cast<UNiagaraSystemEditorData>(System->GetEditorData())) {
+				EditorData->SynchronizeOverviewGraphWithSystem(*System);
+			}
+			System->RequestCompile(true);
+		}
+#endif
 #if UE5_4_BEYOND
 		for (const FParentDuringLoad& Entry : Parents) {
 			Entry.Data->VersionedParent = Entry.Parent;
@@ -206,4 +381,5 @@ void INiagaraSystemImporter::Repair(UObject* Asset) const {
 #endif
 	}
 #endif
+	return true;
 }

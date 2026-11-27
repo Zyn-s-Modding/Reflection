@@ -7,6 +7,11 @@
 #include "Modules/UI/Import/SImportIssuesPanel.h"
 #include "Settings/Redirector.h"
 
+#include "Dom/JsonObject.h"
+#include "Interfaces/IPluginManager.h"
+#include "Misc/FileHelper.h"
+#include "Serialization/JsonSerializer.h"
+
 #define LOCTEXT_NAMESPACE "Reflection.ImportIssues"
 
 namespace {
@@ -275,3 +280,188 @@ void FImportIssues::Clear() {
 }
 
 #undef LOCTEXT_NAMESPACE
+
+namespace {
+	TSet<FString>& HandledFields() {
+		static TSet<FString> Fields;
+		return Fields;
+	}
+
+	/* Built data the importer has the engine rebuild from the imported asset: reported apart, as
+	 * rebuilt rather than left out, since nothing is lost */
+	TMap<FString, FString>& RebuiltFields() {
+		static TMap<FString, FString> Fields;
+		return Fields;
+	}
+
+	struct FFieldAlias {
+		FString From;
+		/* Leaf of the source value -> this engine's value; "*" for anything else. Empty: as it is. */
+		TMap<FString, TSharedPtr<FJsonValue>> Map;
+	};
+
+	TMap<FString, FFieldAlias>& FieldAliases() {
+		static TMap<FString, FFieldAlias> Aliases;
+		return Aliases;
+	}
+
+	/* Resources/ReflectionFields.json, read the first time a field is asked about */
+	void ReadKnownFields() {
+		static bool bRead = false;
+		if (bRead) return;
+		bRead = true;
+
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Reflection"));
+		const FString File = Plugin.IsValid() ? Plugin->GetBaseDir() / TEXT("Resources/ReflectionFields.json") : FString();
+		FString Text;
+		TSharedPtr<FJsonObject> Root;
+		if (File.IsEmpty() || !FFileHelper::LoadFileToString(Text, *File) || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Root) || !Root.IsValid()) {
+			UE_LOG(LogReflection, Warning, TEXT("Known source fields could not be read from \"%s\"; every field without a property here will be reported"), *File);
+			return;
+		}
+
+		const TSharedPtr<FJsonObject>* Ignored = nullptr;
+		if (Root->TryGetObjectField(TEXT("Ignored"), Ignored)) {
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Type : (*Ignored)->Values) {
+				const TSharedPtr<FJsonObject>* Entry = nullptr;
+				const TArray<TSharedPtr<FJsonValue>>* Fields = nullptr;
+				if (!Type.Value.IsValid() || !Type.Value->TryGetObject(Entry) || !(*Entry)->TryGetArrayField(TEXT("Fields"), Fields)) continue;
+				for (const TSharedPtr<FJsonValue>& Field : *Fields) {
+					FString Name;
+					if (Field.IsValid() && Field->TryGetString(Name)) HandledFields().Add(Type.Key + TEXT(".") + Name);
+				}
+			}
+		}
+
+		const TSharedPtr<FJsonObject>* Rebuilt = nullptr;
+		if (Root->TryGetObjectField(TEXT("Rebuilt"), Rebuilt)) {
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Type : (*Rebuilt)->Values) {
+				const TSharedPtr<FJsonObject>* Entry = nullptr;
+				const TArray<TSharedPtr<FJsonValue>>* Fields = nullptr;
+				if (!Type.Value.IsValid() || !Type.Value->TryGetObject(Entry) || !(*Entry)->TryGetArrayField(TEXT("Fields"), Fields)) continue;
+				FString Why;
+				(*Entry)->TryGetStringField(TEXT("By"), Why);
+				for (const TSharedPtr<FJsonValue>& Field : *Fields) {
+					FString Name;
+					if (Field.IsValid() && Field->TryGetString(Name)) RebuiltFields().Add(Type.Key + TEXT(".") + Name, Why);
+				}
+			}
+		}
+
+		const TSharedPtr<FJsonObject>* Aliases = nullptr;
+		if (Root->TryGetObjectField(TEXT("Aliases"), Aliases)) {
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Aliases)->Values) {
+				const TSharedPtr<FJsonObject>* Entry = nullptr;
+				FFieldAlias Alias;
+				if (!Pair.Value.IsValid() || !Pair.Value->TryGetObject(Entry) || !(*Entry)->TryGetStringField(TEXT("From"), Alias.From)) continue;
+				const TSharedPtr<FJsonObject>* Map = nullptr;
+				if ((*Entry)->TryGetObjectField(TEXT("Map"), Map)) Alias.Map = (*Map)->Values;
+				FString Type;
+				Pair.Key.Split(TEXT("."), &Type, nullptr);
+				/* The field it is read from is placed, not left out */
+				FString Field = Alias.From;
+				Field.Split(TEXT("."), &Field, nullptr);
+				HandledFields().Add(Type + TEXT(".") + (Field.IsEmpty() ? Alias.From : Field));
+				FieldAliases().Add(Pair.Key, MoveTemp(Alias));
+			}
+		}
+		UE_LOG(LogReflection, Display, TEXT("Read %d known source field(s), %d rebuilt field(s) and %d alias(es) from \"%s\""), HandledFields().Num(), RebuiltFields().Num(), FieldAliases().Num(), *File);
+	}
+
+	/* What rebuilds the field, where the data file says the engine does, for this type or one it derives from */
+	const FString* RebuiltBy(const UStruct* Type, const FString& Field) {
+		ReadKnownFields();
+		for (const UStruct* Each = Type; Each != nullptr; Each = Each->GetSuperStruct()) {
+			if (const FString* By = RebuiltFields().Find(Each->GetName() + TEXT(".") + Field)) return By;
+		}
+		return nullptr;
+	}
+
+	/* Known for this type, one it derives from, or every type */
+	bool IsHandled(const UStruct* Type, const FString& Field) {
+		ReadKnownFields();
+		if (HandledFields().Contains(FString(TEXT("*.")) + Field)) return true;
+		for (const UStruct* Each = Type; Each != nullptr; Each = Each->GetSuperStruct()) {
+			if (HandledFields().Contains(Each->GetName() + TEXT(".") + Field)) return true;
+		}
+		return false;
+	}
+}
+
+void FImportIssues::MarkFieldHandled(const FString& TypeName, const FString& Field) {
+	HandledFields().Add(TypeName + TEXT(".") + Field);
+}
+
+TSharedPtr<FJsonValue> FImportIssues::AliasedValue(const UStruct* Type, const FString& Property, const FJsonObject& Fields) {
+	ReadKnownFields();
+	for (const UStruct* Each = Type; Each != nullptr; Each = Each->GetSuperStruct()) {
+		const FFieldAlias* Alias = FieldAliases().Find(Each->GetName() + TEXT(".") + Property);
+		if (Alias == nullptr) continue;
+		/* From may reach into the field: Constant.X is the X of the source's Constant */
+		TArray<FString> Steps;
+		Alias->From.ParseIntoArray(Steps, TEXT("."));
+		TSharedPtr<FJsonValue> Value = Steps.IsEmpty() ? nullptr : Fields.TryGetField(Steps[0]);
+		for (int32 Step = 1; Step < Steps.Num() && Value.IsValid(); ++Step) {
+			const TSharedPtr<FJsonObject>* Inner = nullptr;
+			Value = Value->TryGetObject(Inner) ? (*Inner)->TryGetField(Steps[Step]) : nullptr;
+		}
+		if (!Value.IsValid() || Alias->Map.IsEmpty()) return Value;
+
+		FString Said;
+		if (!Value->TryGetString(Said)) {
+			if (Value->Type == EJson::Boolean) Said = Value->AsBool() ? TEXT("true") : TEXT("false");
+			else if (Value->Type == EJson::Number) Said = FString::SanitizeFloat(Value->AsNumber(), 0);
+		}
+		FString Leaf;
+		if (Said.Split(TEXT("::"), nullptr, &Leaf, ESearchCase::CaseSensitive, ESearchDir::FromEnd)) Said = Leaf;
+		if (const TSharedPtr<FJsonValue>* Mapped = Alias->Map.Find(Said)) return *Mapped;
+		if (const TSharedPtr<FJsonValue>* Otherwise = Alias->Map.Find(TEXT("*"))) return *Otherwise;
+		return nullptr;
+	}
+	return nullptr;
+}
+
+void FImportIssues::ReportUnplacedFields(const UStruct* Type, const FJsonObject& Fields) {
+	if (Type == nullptr) return;
+
+	/* Core types (vectors, quaternions, transforms) are written with values the exporter works out
+	 * alongside the real ones, and have nothing of their own to lose */
+	if (Type->GetOutermost()->GetFName() == TEXT("/Script/CoreUObject")) return;
+
+	TArray<FString> Left;
+	TArray<FString> Rebuilt;
+	TArray<FString> RebuiltBy_;
+	for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Fields.Values) {
+		FString Key = Field.Key;
+
+		/* Worked out by the exporter from the value beside it, not a field of the type */
+		if (Key == TEXT("Hex")) continue;
+
+		/* One element of a fixed-size array, which the serializer reads as Name[Index] */
+		if (int32 Bracket; Key.EndsWith(TEXT("]")) && Key.FindChar(TEXT('['), Bracket)) Key.LeftInline(Bracket);
+
+		if (Type->FindPropertyByName(FName(*Key)) != nullptr) continue;
+		if (Type->FindPropertyByName(FName(*(Key + TEXT("_DEPRECATED")))) != nullptr) continue;
+		if (IsHandled(Type, Key)) continue;
+		if (const FString* By = RebuiltBy(Type, Key)) {
+			Rebuilt.AddUnique(Key);
+			if (!By->IsEmpty()) RebuiltBy_.AddUnique(*By);
+			continue;
+		}
+
+		Left.AddUnique(Key);
+	}
+
+	if (!Rebuilt.IsEmpty()) {
+		Rebuilt.Sort();
+		Report(EImportIssue::Data, TEXT("Built data was rebuilt by the engine from the imported asset, not copied"),
+			FString::Printf(TEXT("%s: %s%s"), *Type->GetName(), *FString::Join(Rebuilt, TEXT(", ")),
+				RebuiltBy_.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" (%s)"), *FString::Join(RebuiltBy_, TEXT("; ")))));
+	}
+
+	if (Left.IsEmpty()) return;
+
+	Left.Sort();
+	Report(EImportIssue::Data, TEXT("Fields this engine has no property for were left out"),
+		FString::Printf(TEXT("%s: %s"), *Type->GetName(), *FString::Join(Left, TEXT(", "))));
+}

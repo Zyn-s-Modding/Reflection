@@ -42,6 +42,8 @@ struct FRSettings
 {
 	GENERATED_BODY()
 public:
+	static constexpr const TCHAR* DefaultEngineContentFolder = TEXT("/Game/ImportedDependencies");
+
 	/* Constructor to initialize default values */
 	FRSettings() {
 		AnimationBlueprint = FRAnimationBlueprintSettings();
@@ -69,6 +71,14 @@ public:
 	UPROPERTY(EditAnywhere, DisplayName = "Import References", Config, Category = Settings)
 	bool ImportReferences = true;
 
+	/* Put imported Engine and engine-plugin assets in the project. */
+	UPROPERTY(EditAnywhere, DisplayName = "Redirect Engine Content", Config, Category = Settings)
+	bool bRedirectEngineContent = true;
+
+	/* A Content Browser path under /Game or a project plugin. The source mount and folders are kept inside it. */
+	UPROPERTY(EditAnywhere, Config, Category = Settings, meta = (EditCondition = "bRedirectEngineContent", EditConditionHides))
+	FString EngineContentFolder = DefaultEngineContentFolder;
+
 	/* Whether a blueprint gets its graphs. Off, everything else about it comes across and the graphs are left empty. */
 	UPROPERTY(EditAnywhere, DisplayName = "Import Blueprint Code", Config, Category = Settings)
 	bool ImportBlueprintCode = true;
@@ -91,6 +101,10 @@ public:
 public:
 	UPROPERTY(EditAnywhere, Config, Category = Redirectors, meta = (TitleProperty = "Name"))
 	TArray<FRRedirector> Redirectors;
+
+	/* Prefer an existing asset at its original path before applying redirectors. */
+	UPROPERTY(EditAnywhere, Config, Category = Redirectors, DisplayName = "Only Redirect Missing Assets")
+	bool bRedirectOnlyMissingAssets = true;
 
 	UPROPERTY(EditAnywhere, Config, Category = Settings)
 	FRSettings AssetSettings;

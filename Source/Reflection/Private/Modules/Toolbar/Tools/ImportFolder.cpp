@@ -5,10 +5,12 @@
 #include "Importers/Constructor/ImportIssues.h"
 #include "Modules/Cloud/Cloud.h"
 #include "Modules/Cloud/Remote.h"
+#include "Modules/Cloud/Prefetch.h"
 #include "Modules/Toolbar/Tools/ImportFromPath.h"
 #include "Modules/UI/Reflect/SReflectFolderDialog.h"
 #include "Engine/EngineUtilities.h"
 #include "Utilities/Dialog.h"
+#include "Utilities/ContentBrowser.h"
 
 bool TToolImportFolder::Execute(const FString& InitialFolder, const bool bUseClipboard, const bool bCanGoBack) {
 	if (!Cloud::Status::IsOpened()) {
@@ -50,9 +52,15 @@ void TToolImportFolder::Run(const TArray<FString>& Paths, const TSet<FString>& A
 	bool Cancelled = false;
 
 	FImportIssues::Begin(); {
+		const FScopedImportBrowse BrowseScope;
 		/* Import opens a scope of its own per asset, which is what the dialog ends up showing.
 		 * This one is here to own the Cancel button for the whole run rather than for one asset. */
 		const FBlockingRequestScope BlockingScope(NSLOCTEXT("Reflection", "ReflectingFolder", "Reflecting folder"));
+
+		/* The next few assets are fetched, and taken apart, while the one before them is built.
+		 * Held for the whole folder, and whatever was fetched ahead is let go when it closes. */
+		const FCloudPrefetch::FScope PrefetchScope;
+		TToolImportFromPath::QueueAhead(Paths);
 
 		for (const FString& Path : Paths) {
 			bool WasFiltered = false;
@@ -60,6 +68,8 @@ void TToolImportFolder::Run(const TArray<FString>& Paths, const TSet<FString>& A
 			if (TToolImportFromPath::Import(Path, AllowedTypes, &WasFiltered)) {
 				Reflected++;
 			}
+
+			FCloudPrefetch::AdvanceRun();
 
 			/* A type the filter turned down never had a chance to succeed, so counting it as
 			 * attempted would report the run as failing */

@@ -56,6 +56,11 @@
 			"Enabled": true
 		},
 		{
+			"Name": "Metasound",
+			"Enabled": true,
+			"Optional": true
+		},
+		{
 			"Name": "AudioModulation",
 			"Enabled": true,
 			"Optional": true

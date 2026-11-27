@@ -6,11 +6,16 @@
 #include "HttpModule.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Engine/Log.h"
+#include "Modules/Cloud/Prefetch.h"
 
 namespace {
 	/* How long a blocking wait sits between HTTP ticks: short enough that a quick reply isn't
-	 * held up, long enough not to spin a core for the duration */
-	constexpr float BlockingPollInterval = 0.01f;
+	 * held up, long enough not to spin a core for the duration.
+	 *
+	 * Cloud is on this machine and answers most requests in well under a millisecond, so this is
+	 * most of what a request costs: at ten, an import reaching through a few thousand references
+	 * spent tens of seconds asleep. Repainting stays throttled by the progress dialog itself. */
+	constexpr float BlockingPollInterval = 0.001f;
 
 	/* Progress only appears once a wait has lasted long enough for the user to notice it, so
 	 * operations the Cloud answers immediately never flash a dialog */
@@ -152,6 +157,11 @@ FReflectionHttpResponse FRemoteUtilities::ExecuteRequestBlocking(FReflectionHttp
 		/* Nothing else is driving the manager while this thread is parked here */
 		FHttpModule::Get().GetHttpManager().Tick(static_cast<float>(CurrentTime - LastTime));
 		LastTime = CurrentTime;
+
+		/* Nor the fetches running ahead of the import, which want starting as others finish */
+		FCloudPrefetch::Tick();
+
+		if (EHttpRequestStatus::Processing != HttpRequest->GetStatus()) break;
 
 		if (FBlockingRequestScope::Pump()) {
 			UE_LOG(LogReflection, Log, TEXT("HTTP request cancelled: \"%s\""), *RequestURL);

@@ -121,6 +121,29 @@ public class Reflection : ModuleRules {
 
 		PublicDefinitions.Add("REFLECTION_CURVE_EXPRESSION=" + (bCurveExpression ? "1" : "0"));
 
+		var bMetaSoundRegistry = false;
+#if UE_5_4_OR_LATER
+		var MetaSoundHeaders = Path.Combine(EngineDirectory, "Plugins", "Runtime", "Metasound", "Source", "MetasoundFrontend", "Public");
+		var MetaSoundDocumentHeader = Path.Combine(MetaSoundHeaders, "MetasoundFrontendDocument.h");
+		bMetaSoundRegistry = File.Exists(Path.Combine(MetaSoundHeaders, "MetasoundFrontendSearchEngine.h"))
+			&& File.Exists(MetaSoundDocumentHeader) && File.ReadAllText(MetaSoundDocumentHeader).Contains("FMetasoundFrontendGraph Graph;");
+		if (bMetaSoundRegistry) PrivateDependencyModuleNames.Add("MetasoundFrontend");
+#endif
+		PrivateDefinitions.Add("REFLECTION_METASOUND_REGISTRY=" + (bMetaSoundRegistry ? "1" : "0"));
+
+		var bNiagaraAllocationEstimator = false;
+#if UE_5_4_OR_LATER
+		var NiagaraSource = Path.Combine(EngineDirectory, "Plugins", "FX", "Niagara", "Source", "Niagara");
+		foreach (var HeaderDir in new[] { "Classes", "Public" }) {
+			var Header = Path.Combine(NiagaraSource, HeaderDir, "NiagaraEmitter.h");
+			if (File.Exists(Header) && File.ReadAllText(Header).Contains("FMemoryRuntimeEstimation RuntimeEstimation;")) {
+				bNiagaraAllocationEstimator = true;
+				break;
+			}
+		}
+#endif
+		PrivateDefinitions.Add("REFLECTION_NIAGARA_ALLOCATION_ESTIMATOR=" + (bNiagaraAllocationEstimator ? "1" : "0"));
+
 /* 5.1 and later. 5.0 is left at the standard it ships with: its own Niagara headers declare
  * equality in a way C++20's reversed candidates make ambiguous, and nothing here needs C++20. */
 #if UE_5_1_OR_LATER

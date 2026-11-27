@@ -11,6 +11,8 @@ public:
 	virtual UObject* CreateAsset(UObject* CreatedAsset) override;
 	virtual bool Import() override;
 
+	static UPackage* CreateSourceAnimationPackage(const UPoseAsset& Pose, bool bReuseExisting, FString& OutName);
+
 protected:
 	void ReverseCookLocalSpacePose(USkeleton* Skeleton);
 	static UAnimSequence* CreateAnimSequenceFromPose(USkeleton* Skeleton, const FString& SequenceName, const TSharedPtr<FJsonObject>& PoseContainer, UPackage* Outer);

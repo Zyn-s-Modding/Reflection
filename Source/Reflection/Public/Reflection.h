@@ -16,5 +16,11 @@ public:
     virtual void ShutdownModule() override;
 
 private:
+#if UE5_1_BEYOND
+    void RegisterNiagaraRepair();
+
+    FDelegateHandle NiagaraEditorInit;
+    FDelegateHandle NiagaraEditorOpen;
+#endif
     UReflectionToolbar* Toolbar = nullptr;
 };

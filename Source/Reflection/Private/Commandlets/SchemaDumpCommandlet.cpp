@@ -120,9 +120,14 @@ int32 USchemaDumpCommandlet::Main(const FString& Params) {
 
 		TArray<TSharedPtr<FJsonValue>> Listed = OwnProperties(Struct, Slots);
 
-		/* A struct with nothing of its own says nothing a reader does not already have */
-		if (Listed.Num() == 0) continue;
-
+		/* Written even when it has nothing of its own.
+		 *
+		 * A reader counts through a class by walking from it to its super, so a class in the middle
+		 * with no properties (NiagaraNodeWithDynamicPins, NiagaraNodeParameterMapBase,
+		 * NiagaraScriptSourceBase) is still a link it needs: left out, every class below it loses
+		 * the whole chain above, and anything it reads past its own properties lands nowhere. A
+		 * leaf with nothing of its own (NiagaraNodeParameterMapSet, NiagaraNodeReroute) is a type
+		 * the reader has to know exists at all. Zero slots and an empty list say exactly that. */
 		TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
 
 		if (const UStruct* Super = Struct->GetSuperStruct()) {

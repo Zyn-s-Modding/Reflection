@@ -13,6 +13,7 @@
 #include "Engine/EngineUtilities.h"
 #include "Utilities/JsonHelpers.h"
 #include "Modules/Cloud/Remote.h"
+#include "Modules/Cloud/Prefetch.h"
 
 namespace {
 	/* How long one tick may spend importing. Plenty of single exports run well past this and
@@ -47,6 +48,11 @@ namespace {
 
 		FTimerHandle Timer;
 		TWeakPtr<SNotificationItem> Notification;
+
+		/* References a file reaches for are fetched from Cloud while it is built, and let go when
+		 * the job is done. The file's own exports come off disk, so only its references go here. */
+		TUniquePtr<FCloudPrefetch::FScope> Prefetch;
+		TArray<FString> PrefetchedReferences;
 	};
 
 	TUniquePtr<FJobState> GJob;
@@ -146,6 +152,10 @@ namespace {
 			GJob->Container = Container;
 			GJob->CurrentFile = FilePath;
 			GJob->ExportIndex = 0;
+
+			/* The last file's references it never reached are no use to this one */
+			FCloudPrefetch::Forget(GJob->PrefetchedReferences);
+			GJob->PrefetchedReferences = IImportReader::PrefetchReferencesOf(Container);
 			GJob->bBlueprintOnly = Container->FindByType(FString("BlueprintGeneratedClass"))->IsJsonValid();
 
 			UpdateNotification();
@@ -278,6 +288,7 @@ void FImportJob::Enqueue(const TArray<FString>& Files) {
 
 	GJob = MakeUnique<FJobState>();
 	GJob->Files = Files;
+	GJob->Prefetch = MakeUnique<FCloudPrefetch::FScope>();
 
 	/* Files appended to a running job join its report rather than starting a new one */
 	FImportIssues::Begin();

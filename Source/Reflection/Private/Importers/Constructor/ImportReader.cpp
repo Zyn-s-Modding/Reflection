@@ -2,13 +2,16 @@
 
 #include "Importers/Constructor/ImportReader.h"
 
+#include "Misc/ScopeExit.h"
 #include "UObject/MetaData.h"
+#include "UObject/StrongObjectPtr.h"
 
 #include "Importers/Constructor/ImportIssues.h"
 #include "Importers/Constructor/Importer.h"
 #include "Importers/Constructor/TemplatedImporter.h"
 #include "Importers/Constructor/Types.h"
 #include "Importers/Types/DataAssetImporter.h"
+#include "Importers/Types/Niagara/NiagaraWeightedIntArray.h"
 #include "Importers/Types/Texture/TextureImporter.h"
 #include "Settings/Runtime.h"
 #include "Styling/SlateIconFinder.h"
@@ -19,6 +22,12 @@
 #include "UObject/UObjectHash.h"
 #include "Settings/SettingsAccess.h"
 #include "Settings/Blacklist.h"
+#include "Settings/Redirector.h"
+#include "Importers/Constructor/TypesHelper.h"
+#include "Importers/Types/Texture/TextureTypes.h"
+#include "Modules/Cloud/Cloud.h"
+#include "Modules/Cloud/Prefetch.h"
+#include "Utilities/AssetPaths.h"
 
 #if REFLECTION_RIGVM
 #include "Engine/ControlRigCompatibility.h"
@@ -141,6 +150,138 @@ namespace {
 
 		return Ordered;
 	}
+
+	/* Every reference in a tree, as the ObjectName and ObjectPath it is written with */
+	void CollectReferences(const TSharedPtr<FJsonValue>& Value, TSet<FString>& Seen, TArray<TPair<FString, FString>>& Out) {
+		if (!Value.IsValid()) return;
+
+		if (Value->Type == EJson::Object) {
+			const TSharedPtr<FJsonObject> Object = Value->AsObject();
+
+			FString Named, Path;
+
+			if (Object->TryGetStringField(TEXT("ObjectName"), Named) && Object->TryGetStringField(TEXT("ObjectPath"), Path)) {
+				if (!Seen.Contains(Path + Named)) {
+					Seen.Add(Path + Named);
+					Out.Emplace(MoveTemp(Named), MoveTemp(Path));
+				}
+
+				return;
+			}
+
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Object->Values) {
+				CollectReferences(Pair.Value, Seen, Out);
+			}
+
+			return;
+		}
+
+		if (Value->Type == EJson::Array) {
+			for (const TSharedPtr<FJsonValue>& One : Value->AsArray()) {
+				CollectReferences(One, Seen, Out);
+			}
+		}
+	}
+
+	/* How many of one package's references are worth fetching ahead. A data table can name
+	 * thousands, and past a point the import is better off asking as it goes. */
+	constexpr int32 MaxPrefetchedReferences = 256;
+
+	/* Has Cloud fetch what this package is going to reach for, while it is being built.
+	 *
+	 * The same references the import would fetch through ConstructAsset, filtered the way that and
+	 * DownloadWrapper filter them: another package's asset, of a type Cloud imports, not blacklisted,
+	 * and not one the project already holds. Anything let through that turns out not to be wanted
+	 * is only a request wasted, since the answer is simply never taken. */
+	TArray<FString> PrefetchReferences(FUObjectExportContainer* Container) {
+		const UReflectionSettings* Settings = GetSettings();
+
+		if (!FAssetUtilities::bImportReferences || !Settings->AssetSettings.ImportReferences) return {};
+
+		/* Without it a Cloud path cannot be turned into the editor one it lands at */
+		if (GReflectionRuntime.Profile.ProjectName.IsEmpty()) return {};
+
+		/* Asked the way ConstructAsset asks before fetching anything */
+		if (!IsRunningCommandlet() && !Cloud::Status::IsOpened()) return {};
+
+		FString Package;
+
+		for (const FUObjectExport* Export : Container->Exports) {
+			if (Export->IsJsonValid() && Export->JsonObject->TryGetStringField(TEXT("Package"), Package)) break;
+		}
+
+		TSet<FString> Seen;
+		TArray<TPair<FString, FString>> References;
+
+		for (const FUObjectExport* Export : Container->Exports) {
+			if (Export->IsJsonValid()) {
+				CollectReferences(MakeShared<FJsonValueObject>(Export->JsonObject), Seen, References);
+			}
+		}
+
+		TSet<FString> Queued;
+		TArray<FString> Paths;
+
+		for (const TPair<FString, FString>& Reference : References) {
+			if (Paths.Num() >= MaxPrefetchedReferences) break;
+
+			FString Type, Name;
+
+			if (!Reference.Key.Split(TEXT("'"), &Type, &Name)) continue;
+
+			Name.ReplaceInline(TEXT("'"), TEXT(""));
+
+			/* Something inside a package rather than the asset it holds, which is reached through
+			 * the asset if at all */
+			if (Type.IsEmpty() || Name.IsEmpty() || Name.Contains(TEXT(":"))) continue;
+			if (Type == TEXT("WidgetBlueprintGeneratedClass")) continue;
+
+			FString Within = Reference.Value;
+			Reference.Value.Split(TEXT("."), &Within, nullptr);
+
+			/* This package's own, compiled into the build, or the engine's */
+			if (Within.IsEmpty() || Within == Package) continue;
+			if (Within.StartsWith(TEXT("/Script/")) || Within.StartsWith(TEXT("Engine/")) || Within.StartsWith(TEXT("/Engine/"))) continue;
+
+			if (!CanImport(Type, true) && !FTextureTypes::IsSupported(Type)) continue;
+
+			const FString Direct = ToEditorPackagePathDirect(Within);
+
+			if (Direct.StartsWith(TEXT("/Engine/")) || Direct.StartsWith(TEXT("/Script/"))) continue;
+
+			/* Where it lands, asked without recording a redirect for a path nothing has fetched */
+			const FRRedirectPreview Landing = FRRedirects::Preview(Direct);
+			const FString Lands = Landing.Moved() ? Landing.Path : Direct;
+
+			const bool bReflectAnyway = Settings->AssetSettings.Texture.ReflectExistingTextures && Type == TEXT("Texture2D");
+
+			if (!bReflectAnyway && PackageHoldsAsset(Lands)) continue;
+
+			/* Spelled the way DownloadWrapper asks for it */
+			const FString Asked = Direct + TEXT(".") + Name;
+
+			if (FRBlacklist::IsBlacklisted(Type, Asked) || FRBlacklist::IsPathBlacklisted(Lands)) continue;
+			if (Queued.Contains(Direct)) continue;
+
+			Queued.Add(Direct);
+			Paths.Add(Asked);
+		}
+
+		return FCloudPrefetch::QueueReferences(Paths);
+	}
+
+	/* Lets go of whatever this import queued and never reached, once it is done */
+	struct FReferencePrefetch {
+		TArray<FString> Keys;
+
+		~FReferencePrefetch() {
+			if (Keys.Num() > 0) FCloudPrefetch::Forget(Keys);
+		}
+	};
+}
+
+TArray<FString> IImportReader::PrefetchReferencesOf(FUObjectExportContainer* Container) {
+	return Container != nullptr ? PrefetchReferences(Container) : TArray<FString>();
 }
 
 bool IImportReader::ReadExportsAndImport(const TArray<TSharedPtr<FJsonValue>>& Exports, const FString& File, IImporter*& OutImporter, const bool HideNotifications, bool bUseRelativePath) {
@@ -156,6 +297,12 @@ bool IImportReader::ReadExportsAndImport(const TArray<TSharedPtr<FJsonValue>>& E
 	const FAssetUtilities::FRunScope RunScope;
 
 	FUObjectExportContainer* Container = new FUObjectExportContainer(Exports);
+	FNiagaraWeightedIntArray::Prepare(*Container);
+
+	/* What this package reaches for is fetched while it is built, rather than one at a time as each
+	 * reference is reached. The scope lets go of anything the run never takes. */
+	const FCloudPrefetch::FScope PrefetchScope;
+	const FReferencePrefetch References { PrefetchReferences(Container) };
 
 	const bool IsBlueprint = Container->FindByType(FString("BlueprintGeneratedClass"))->IsJsonValid();
 	
@@ -172,6 +319,32 @@ bool IImportReader::ReadExportsAndImport(const TArray<TSharedPtr<FJsonValue>>& E
 	 * no importer of their own, so this is only worth saying once the whole package has been walked
 	 * and come to nothing: otherwise the run counts a file it did not import as one it did. */
 	if (OutImporter == nullptr && bAnyImportAttempted) return false;
+
+	/* A redirector the game left where an asset used to be, after the asset moved. What it points
+	 * to is the asset that was asked for, so that is what is imported, and the move is said. A
+	 * chain of them is followed a few steps and no further. */
+	if (OutImporter == nullptr) {
+		static int32 Followed = 0;
+		const FUObjectExport* Redirector = Container->FindByType(FString("ObjectRedirector"));
+		const TSharedPtr<FJsonObject>* Destination = nullptr;
+		FString Target;
+		if (Redirector->IsJsonValid() && Redirector->JsonObject->TryGetObjectField(TEXT("DestinationObject"), Destination)
+			&& (*Destination)->TryGetStringField(TEXT("ObjectPath"), Target) && !Target.IsEmpty() && Followed < 4) {
+			/* "/Mount/Path/Asset.113": the number is the export index, not part of the package */
+			FString Package = Target;
+			if (int32 Dot; Package.FindLastChar(TEXT('.'), Dot) && Package.Mid(Dot + 1).IsNumeric()) Package.LeftInline(Dot);
+			const TSharedPtr<FJsonObject> Response = Cloud::Export::GetRawBlocking(Package);
+			const TArray<TSharedPtr<FJsonValue>>* Moved = nullptr;
+			if (Response.IsValid() && Response->TryGetArrayField(TEXT("exports"), Moved) && Moved->Num() > 0) {
+				FImportIssues::ReportFor(FPaths::GetBaseFilename(File), File, TEXT("ObjectRedirector"), EImportIssue::Data,
+					TEXT("The asset moved in the game, and what it moved to was imported"),
+					FString::Printf(TEXT("\"%s\" is a redirector to \"%s\""), *File, *Package));
+				++Followed;
+				ON_SCOPE_EXIT { --Followed; };
+				return ReadExportsAndImport(*Moved, Package, OutImporter, HideNotifications, bUseRelativePath);
+			}
+		}
+	}
 
 	if (OutImporter == nullptr) {
 		const FString Name = FPaths::GetBaseFilename(File);
@@ -273,7 +446,9 @@ IImporter* IImportReader::ReadExportAndImport(FUObjectExportContainer* Container
 	 * so offered here it is taken as an asset and everything the outer one is made of is built
 	 * under the copy instead. The outer emitter then comes out with no scripts, no renderers and
 	 * no graph source, and its PostLoad reads through the last of those. */
-	static const TArray<FString> HeldByTheirOuter = { TEXT("FontFace"), TEXT("NiagaraScript"), TEXT("NiagaraEmitter") };
+	static const TArray<FString> HeldByTheirOuter = {
+		TEXT("FontFace"), TEXT("NiagaraScript"), TEXT("NiagaraEmitter"), TEXT("NiagaraParameterCollectionInstance")
+	};
 
 	if (HeldByTheirOuter.Contains(Type) && Container->Find(Export->GetOuter())->IsJsonValid()) {
 		return nullptr;
@@ -408,6 +583,8 @@ IImporter* IImportReader::ReadExportAndImport(FUObjectExportContainer* Container
 	}
 
 	Export->Package = LocalPackage;
+	// Importers are native objects. Keep their serializers alive while nested imports compile assets and collect garbage.
+	const TStrongObjectPtr<UObjectSerializer> KeepSerializer(Importer->GetObjectSerializer());
 	Importer->Initialize(Export, Container);
 	if (bImportAttempted != nullptr) *bImportAttempted = true;
 

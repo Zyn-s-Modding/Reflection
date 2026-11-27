@@ -2,12 +2,15 @@
 
 #include "Settings/Redirector.h"
 
+#include "Importers/Constructor/Asset.h"
+#include "Misc/PackageName.h"
+
 #include "Settings/ReflectionSettings.h"
 #include "Settings/Runtime.h"
-#include "Engine/EngineUtilities.h"
+#include "Importers/Constructor/Importer.h"
 
 /********* Redirect History ************ */
-TMap<FString, TArray<FRRedirectorPoint>> FRRedirects::History;
+TMap<FString, FString> FRRedirects::History;
 
 bool FRRedirector::IsEnabled() const {
 	bool bIsEnabled = Enable;
@@ -25,29 +28,58 @@ void FRRedirects::Clear() {
 	History.Empty();
 }
 
-/* The first time a path says something, and only the first.
- *
- * A folder name is not unique down a path: "/Game/Folder/Game/" says Game twice, and the one that
- * was meant is the one at the front the rest are folders somebody named, which happen to read
- * the same. Replaced everywhere, redirecting /Game/ rewrites both and the asset is looked for
- * somewhere that does not exist.
- *
- * The first rather than the front, since a redirect is not always rooted: "Animation/Game" is a
- * way down into a path and has the same trouble with the same folder. */
-static bool ReplaceFirst(FString& Path, const FString& From, const FString& To) {
+static bool ApplyPoint(FString& Path, const FString& From, const FString& To) {
 	if (From.IsEmpty()) return false;
 
-	const int32 At = Path.Find(From, ESearchCase::IgnoreCase, ESearchDir::FromStart);
-
+	const bool bRooted = From.StartsWith(TEXT("/"));
+	const int32 At = bRooted ? (Path.StartsWith(From, ESearchCase::IgnoreCase) ? 0 : INDEX_NONE)
+		: Path.Find(From, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 	if (At == INDEX_NONE) return false;
+	const int32 End = At + From.Len();
+	if (bRooted && !From.EndsWith(TEXT("/")) && End < Path.Len()
+		&& Path[End] != TEXT('/') && Path[End] != TEXT('.') && Path[End] != TEXT(':')) return false;
 
-	Path = Path.Left(At) + To + Path.RightChop(At + From.Len());
+	FString Replacement = To;
+	FString Suffix = Path.RightChop(End);
+	if (bRooted && !Replacement.IsEmpty()) {
+		if (Replacement.EndsWith(TEXT("/")) && Suffix.StartsWith(TEXT("/"))) Suffix.RightChopInline(1);
+		else if (From.EndsWith(TEXT("/")) && !Replacement.EndsWith(TEXT("/"))) Replacement += TEXT("/");
+	}
+	Path = Path.Left(At) + Replacement + Suffix;
 
 	return true;
 }
 
-void FRRedirects::Redirect(FString& Path) {
-	TArray<FRRedirectorPoint> Points;
+static bool HasOriginalAsset(const FString& Path) {
+	if (Path.IsEmpty() || Path.EndsWith(TEXT("/"))) return false;
+
+	const FString Package = FPackageName::ObjectPathToPackageName(Path);
+	if (!FPackageName::IsValidLongPackageName(Package)) return false;
+
+	if (const UPackage* InMemory = FindPackage(nullptr, *Package)) {
+		TArray<UObject*> Objects;
+		GetObjectsWithOuter(InMemory, Objects, false);
+		for (const UObject* Object : Objects) {
+			if (IsValid(Object) && Object->IsAsset() && !Object->IsA<UObjectRedirector>()) return true;
+		}
+		if (InMemory->IsFullyLoaded()) return false;
+	}
+
+	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	TArray<FAssetData> Assets;
+	const FName PackageName(*Package);
+	Registry.GetAssetsByPackageName(PackageName, Assets, true);
+	if (Assets.IsEmpty()) {
+		FString Filename;
+		if (!PackageFileOf(Package, Filename)) return false;
+		Registry.ScanFilesSynchronous({Filename});
+		Registry.GetAssetsByPackageName(PackageName, Assets, true);
+	}
+	return Assets.ContainsByPredicate([](const FAssetData& Asset) { return !Asset.IsRedirector(); });
+}
+
+void FRRedirects::Redirect(FString& Path, const FString& AlternatePackage) {
+	FString Destination = Path;
 
 	const UReflectionSettings* Settings = GetSettings();
 
@@ -55,14 +87,29 @@ void FRRedirects::Redirect(FString& Path) {
 		if (!Redirect.IsEnabled()) continue;
 
 		for (const FRRedirectorPoint& Point : Redirect.Points) {
-			if (ReplaceFirst(Path, Point.From, Point.To)) {
-				Points.Add(Point);
-			}
+			ApplyPoint(Destination, Point.From, Point.To);
 		}
 	}
 
-	TArray<FRRedirectorPoint>& Pointers = History.FindOrAdd(Path);
-	Pointers.Append(Points);
+	/* A run confined to one folder (a commandlet's -onlyunder=) takes in what the game keeps under
+	 * a mount this project doesn't have, a game plugin a normal import would create, under that
+	 * folder too, and looks for it there. A test import then reaches everything a real one does
+	 * without writing anywhere else. Mounts the project has are left to the refusal. */
+	if (!FAssetUtilities::OnlyUnder.IsEmpty() && Destination.StartsWith(TEXT("/")) && !FAssetUtilities::IsAllowedDestination(Destination)) {
+		const int32 Slash = Destination.Find(TEXT("/"), ESearchCase::CaseSensitive, ESearchDir::FromStart, 1);
+		const FString Root = Slash == INDEX_NONE ? Destination + TEXT("/") : Destination.Left(Slash + 1);
+		if (Root.Len() > 2 && !FPackageName::MountPointExists(Root)) {
+			FString Under = FAssetUtilities::OnlyUnder;
+			while (Under.RemoveFromEnd(TEXT("/"))) {}
+			Destination = Under + Destination;
+		}
+	}
+
+	if (Destination.Equals(Path, ESearchCase::CaseSensitive)) return;
+	if (Settings->bRedirectOnlyMissingAssets && (HasOriginalAsset(Path) || HasOriginalAsset(AlternatePackage))) return;
+
+	History.Add(Destination, Path);
+	Path = MoveTemp(Destination);
 }
 
 FRRedirectPreview FRRedirects::Preview(const FString& InPath) {
@@ -82,7 +129,7 @@ FRRedirectPreview FRRedirects::Preview(const FString& InPath) {
 		bool Matched = false;
 
 		for (const FRRedirectorPoint& Point : Redirect.Points) {
-			if (ReplaceFirst(Preview.Path, Point.From, Point.To)) {
+			if (ApplyPoint(Preview.Path, Point.From, Point.To)) {
 				Matched = true;
 			}
 		}
@@ -94,19 +141,14 @@ FRRedirectPreview FRRedirects::Preview(const FString& InPath) {
 		}
 	}
 
+	if (Preview.Path.Equals(InPath, ESearchCase::CaseSensitive)
+		|| (Settings->bRedirectOnlyMissingAssets && HasOriginalAsset(InPath))) {
+		return {InPath, {}, {}};
+	}
+
 	return Preview;
 }
 
 void FRRedirects::Reverse(FString& Path) {
-	TArray<FRRedirectorPoint>* Points = History.Find(Path);
-	if (!Points) {
-		return;
-	}
-
-	/* Undone the way it was done, one for one and last first */
-	for (int32 At = Points->Num() - 1; At >= 0; --At) {
-		const FRRedirectorPoint& Point = (*Points)[At];
-
-		ReplaceFirst(Path, Point.To, Point.From);
-	}
+	if (const FString* Original = History.Find(Path)) Path = *Original;
 }

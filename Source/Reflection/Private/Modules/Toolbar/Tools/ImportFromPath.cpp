@@ -11,10 +11,12 @@
 #include "Importers/Types/Texture/TextureTypes.h"
 #include "Modules/Cloud/Cloud.h"
 #include "Modules/Cloud/Remote.h"
+#include "Modules/Cloud/Prefetch.h"
 #include "Modules/Toolbar/Tools/ImportFolder.h"
 #include "Modules/UI/Reflect/SReflectPathsDialog.h"
 #include "Engine/EngineUtilities.h"
 #include "Settings/Blacklist.h"
+#include "Utilities/ContentBrowser.h"
 
 void TToolImportFromPath::Execute() {
 	/* Nothing is asked of Cloud to put a list together, so it is not asked for until Reflect is */
@@ -54,9 +56,18 @@ void TToolImportFromPath::Execute() {
 
 	FImportIssues::Begin();
 
-	for (const FString& Path : Paths) {
-		if (Import(Path)) {
-			Reflected++;
+	{
+		const FScopedImportBrowse BrowseScope;
+		/* The next few are fetched while the one before them is being built */
+		const FCloudPrefetch::FScope PrefetchScope;
+		QueueAhead(Paths);
+
+		for (const FString& Path : Paths) {
+			if (Import(Path)) {
+				Reflected++;
+			}
+
+			FCloudPrefetch::AdvanceRun();
 		}
 	}
 
@@ -74,7 +85,7 @@ void TToolImportFromPath::Execute() {
 	FImportIssues::Finish();
 }
 
-bool TToolImportFromPath::Import(const FString& InPath, const TSet<FString>& AllowedTypes, bool* bOutFiltered) {
+FString TToolImportFromPath::ToPackagePath(const FString& InPath) {
 	/* Take whatever gets pasted: Type'/Game/Path/Asset.Asset', a path with an extension on it,
 	 * or a bare package path */
 	FString PackagePath = StripObjectOuter(InPath.TrimStartAndEnd());
@@ -89,6 +100,34 @@ bool TToolImportFromPath::Import(const FString& InPath, const TSet<FString>& All
 	}
 
 	PackagePath.TrimStartAndEndInline();
+
+	return PackagePath;
+}
+
+void TToolImportFromPath::QueueAhead(const TArray<FString>& Paths) {
+	TArray<FString> Ahead;
+	Ahead.Reserve(Paths.Num());
+
+	for (const FString& Path : Paths) {
+		FString PackagePath = ToPackagePath(Path);
+
+		/* Never fetched by Import, so never fetched ahead of it either. Left as an empty slot
+		 * rather than taken out, so the run's paths still line up one for one. */
+		FString AssetName;
+		PackagePath.Split(TEXT("/"), nullptr, &AssetName, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+
+		if (PackagePath.IsEmpty() || FRBlacklist::IsPathBlacklisted(PackagePath, AssetName)) {
+			PackagePath.Reset();
+		}
+
+		Ahead.Add(MoveTemp(PackagePath));
+	}
+
+	FCloudPrefetch::QueueRun(Ahead);
+}
+
+bool TToolImportFromPath::Import(const FString& InPath, const TSet<FString>& AllowedTypes, bool* bOutFiltered) {
+	const FString PackagePath = ToPackagePath(InPath);
 
 	if (PackagePath.IsEmpty()) {
 		return false;
@@ -161,7 +200,7 @@ bool TToolImportFromPath::Import(const FString& InPath, const TSet<FString>& All
 		return false;
 	}
 
-	const TArray<TSharedPtr<FJsonValue>> Exports = Response->GetArrayField(TEXT("exports"));
+	const TArray<TSharedPtr<FJsonValue>>& Exports = Response->GetArrayField(TEXT("exports"));
 	if (Exports.Num() == 0) {
 		ReportUnreachable(EImportIssue::MissingAsset, TEXT("Cloud has nothing at this path"));
 
@@ -199,7 +238,8 @@ bool TToolImportFromPath::Import(const FString& InPath, const TSet<FString>& All
 	if (FTextureTypes::IsSupported(Type)) {
 		UTexture* Texture = nullptr;
 
-		return FTextureImport::FromCloud(PackagePath + "." + AssetName, PackagePath, Texture);
+		/* Built from the answer already in hand rather than asked for again */
+		return FTextureImport::FromResponse(Response, PackagePath + "." + AssetName, PackagePath, Texture);
 	}
 
 	IImporter* OutImporter = nullptr;

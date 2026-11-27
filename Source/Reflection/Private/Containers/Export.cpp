@@ -2,6 +2,7 @@
 
 #include "Containers/Export.h"
 #include "Engine/EngineUtilities.h"
+#include "Engine/BlueprintGeneratedClass.h"
 #include "Settings/Runtime.h"
 #include "Importers/Types/Blueprint/BlueprintUtilities.h"
 #include "Importers/Constructor/Importer.h"
@@ -52,51 +53,18 @@ UClass* FUObjectExport::GetClass() {
 		OutClass = FindClassByType(GetType().ToString());
 	}
 
-	/* A class written as a path is one made in the editor rather than in C++.
-	 *
-	 * Looking for it by name only finds it where something has already asked for it, and for these
-	 * nothing has: a level names the blueprints its actors are, and each of those is an asset of
-	 * its own that no part of reading the level has any reason to have loaded. Asked for by the
-	 * path it is written as, the blueprint comes in and the class it generated is the one the
-	 * export is. Left unasked, every one of them reads as no class at all. */
 	if (!OutClass && ClassName.Contains(TEXT("/"))) {
-		FString Asset = ClassName;
-		Asset.Split(TEXT("."), &Asset, nullptr, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-
-		OutClass = LoadBlueprintClass(Asset);
-
-		/* And asked for where the project has not got it yet.
-		 *
-		 * Looking is only half of it. A widget tree is full of other widget blueprints, and each of
-		 * them is an asset of its own that nothing in reading this one has any reason to have
-		 * brought in: what a widget is comes from the export's own header rather than from its
-		 * properties, so nothing goes looking for it the way a property that names something
-		 * missing does. Left unasked every one of them reads as no class at all and the widget is
-		 * not made, so the tree comes out with the plain widgets in it and holes where the rest
-		 * were.
-		 *
-		 * It reaches as far as it needs to, since what comes in is read the same way and asks for
-		 * whatever it is made of. */
-		/* And only where the project has not got it: a blueprint with an error reads as missing every time, and fetching writes over it */
-		if (!OutClass && !PackageHoldsAsset(Asset) && TToolImportFromPath::Import(Asset)) {
-			OutClass = LoadBlueprintClass(Asset);
-		}
+		OutClass = LoadOrImportBlueprintClass(ClassName);
 	}
 
-	/* Where it says it comes from, which is written beside the export as often as it is written
-	 * among its properties */
-	TSharedPtr<FJsonObject> Comes = GetSuperStructJsonObject(GetProperties());
+	// A Blueprint class export describes its parent. Its export type is a class metadata object.
+	TSharedPtr<FJsonObject> ParentReference = GetSuperStructJsonObject(GetProperties());
+	if (!ParentReference.IsValid()) ParentReference = GetSuperStructJsonObject(JsonObject);
 
-	if (!Comes.IsValid()) {
-		Comes = GetSuperStructJsonObject(JsonObject);
-	}
-
-	/* Kept only where it answers to something. A parent that cannot be found leaves the class it
-	 * was read as, which is a better guess than nothing at all. */
-	if (Comes.IsValid()) {
-		if (UClass* ParentClass = LoadClass(Comes)) {
-			OutClass = ParentClass;
-		}
+	if (UClass* ParentClass = ParentReference.IsValid() ? LoadClass(ParentReference) : nullptr) {
+		OutClass = ParentClass;
+	} else if (OutClass != nullptr && OutClass->IsChildOf(UBlueprintGeneratedClass::StaticClass())) {
+		return nullptr;
 	}
 
 	if (!OutClass) return nullptr;

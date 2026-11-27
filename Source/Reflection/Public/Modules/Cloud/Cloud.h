@@ -86,7 +86,9 @@ public:
 		/* Asks the export endpoint for bytes rather than json, with ContentType picking the
 		 * encoding. False when the Cloud couldn't produce the payload, which it says by answering
 		 * with json instead. */
-		static bool GetBinaryBlocking(const FString& Path, const FString& ContentType, TArray<uint8>& OutData, const FString& Named = FString());
+		static bool GetBinaryBlocking(const FString& Path, const FString& ContentType, TArray<uint8>& OutData, const FString& Named = FString(), FString* OutContentType = nullptr);
+		static FReflectionHttpRequest BuildBinaryRequest(const FString& Path, const FString& ContentType, const FString& Named);
+		static bool ReadBinaryResponse(const FReflectionHttpResponse& Response, TArray<uint8>& OutData, FString* OutContentType);
 
 		/* Alternate skin weights, one entry per profile. Not properties, so not in the export:
 		 * they live in the LOD's cooked override tables. Empty for anything without them. */
@@ -239,10 +241,21 @@ public:
 	 * Content Browser, goes through here to get a call stack of its own. */
 	static void RunWhenSafe(TFunction<void()> Work);
 
-private:
+	/* A request to the Cloud with the build pinned and the parameters encoded, not yet sent */
 	static FReflectionHttpRequest BuildRequest(const FString& RequestURL, const TMap<FString, FString>& Parameters, const TMap<FString, FString>& Headers);
 
-	/* Shared response handling for both Get flavours: a response is only usable if it arrived,
-	 * came back 200, says it is JSON, and parses. */
+	/* Says the request can take Reflection Binary JSON as well as json, which Cloud answers in
+	 * where it knows how. Left off with Reflection.Cloud.BinaryTransport set to 0. */
+	static void AcceptStructured(const FReflectionHttpRequest& Request);
+
+	/* The tree an answer holds, whichever of json or Reflection Binary JSON it came in. Null unless
+	 * it arrived, came back 200 and parses.
+	 *
+	 * Reads nothing but the response, so it is safe on any thread, which is what lets an answer be
+	 * taken apart off the game thread. */
+	static TSharedPtr<FJsonObject> DecodeResponse(const FReflectionHttpResponse& Response);
+
+private:
+	/* Shared response handling for both Get flavours, which is DecodeResponse */
 	static TSharedPtr<FJsonObject> ParseResponse(const FReflectionHttpResponse& Response);
 };

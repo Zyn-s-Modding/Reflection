@@ -2,12 +2,26 @@
 
 #include "Importers/Types/Niagara/NiagaraEmitterImporter.h"
 #include "Importers/Types/Niagara/NiagaraGraphs.h"
+#include "Importers/Types/Niagara/NiagaraSystemImporter.h"
 #include "Importers/Types/Niagara/NiagaraVersions.h"
 #include "Importers/Types/Niagara/NiagaraCookedCache.h"
 
 #include "Engine/EngineUtilities.h"
 
 #include "UObject/UnrealType.h"
+
+#if UE5_1_BEYOND
+#include "NiagaraEmitter.h"
+#include "NiagaraGraph.h"
+#include "NiagaraScriptSource.h"
+#include "NiagaraSystem.h"
+#endif
+#if REFLECTION_NIAGARA_ALLOCATION_ESTIMATOR
+#include "Utilities/PrivateMemberAccessor.h"
+
+DEFINE_PRIVATE_MEMBER_ACCESSOR(FNiagaraRuntimeEstimation, &FVersionedNiagaraEmitterData::RuntimeEstimation,
+	FMemoryRuntimeEstimation FVersionedNiagaraEmitterData::*)
+#endif
 
 namespace {
 	/* What a script says it is for.
@@ -71,6 +85,16 @@ namespace {
 		return nullptr;
 	}
 
+	UObject* ReadScriptSlot(const FNiagaraVersion& Version, const FString& Field, const FString& Inner) {
+		return Inner.IsEmpty() ? FNiagaraVersions::GetObject(Version, *Field)
+			: FNiagaraVersions::GetObjectIn(Version, *Field, *Inner);
+	}
+
+	bool WriteScriptSlot(const FNiagaraVersion& Version, const FString& Field, const FString& Inner, UObject* Script) {
+		return Inner.IsEmpty() ? FNiagaraVersions::SetObject(Version, *Field, Script)
+			: FNiagaraVersions::SetObjectIn(Version, *Field, *Inner, Script);
+	}
+
 	/* The source a version is written in, asked of the scripts it says it runs.
 	 *
 	 * The version does not name the source itself in anything that comes across, since that is a
@@ -91,6 +115,41 @@ namespace {
 
 		return nullptr;
 	}
+
+	bool UsesCpuSimulation(const FNiagaraVersion& Version) {
+		const FEnumProperty* Target = FindFProperty<FEnumProperty>(Version.Struct, TEXT("SimTarget"));
+		if (Target == nullptr) return false;
+		const int64 Cpu = Target->GetEnum()->GetValueByNameString(TEXT("CPUSim"));
+		return Cpu != INDEX_NONE && Target->GetUnderlyingProperty()->GetSignedIntPropertyValue(
+			Target->ContainerPtrToValuePtr<void>(Version.Data)) == Cpu;
+	}
+
+	int32 RemoveEmptyRendererSlots(const FNiagaraVersion& Version) {
+		const FArrayProperty* Property = FindFProperty<FArrayProperty>(Version.Struct, TEXT("RendererProperties"));
+		const FObjectPropertyBase* Renderer = Property != nullptr ? CastField<FObjectPropertyBase>(Property->Inner) : nullptr;
+		if (Renderer == nullptr) return 0;
+
+		FScriptArrayHelper Slots(Property, Property->ContainerPtrToValuePtr<void>(Version.Data));
+		const int32 Before = Slots.Num();
+		for (int32 Index = Before - 1; Index >= 0; --Index) {
+			if (Renderer->GetObjectPropertyValue(Slots.GetRawPtr(Index)) == nullptr) Slots.RemoveValues(Index);
+		}
+		return Before - Slots.Num();
+	}
+}
+
+/* Refused the way a script or a system is when its graph came across without its wiring.
+ *
+ * An emitter built from nodes with no pins saves without complaint and then crashes the editor the
+ * first time anything asks its graph to compile, so the empty graph is caught here rather than
+ * handed over. The exports are prepared in Prepare, which the base import calls. */
+bool INiagaraEmitterImporter::Import() {
+	if (!FNiagaraGraphs::HasSerializedPins(GetContainer())) return false;
+	return IObjectImporter::Import();
+}
+
+void INiagaraEmitterImporter::Prepare(UObject* Asset) const {
+	FNiagaraGraphs::PrepareExports(*GetContainer(), *GetObjectSerializer());
 }
 
 void INiagaraEmitterImporter::Repair(UObject* Asset) const {
@@ -113,7 +172,26 @@ void INiagaraEmitterImporter::Repair(UObject* Asset) const {
 	}
 
 	FNiagaraCookedCache::Restore(Container);
+	FNiagaraCookedCache::RestoreRendererBindings(Container);
 	RestoreVersions(Asset, Container);
+	InitializeRuntime(Asset);
+}
+
+void INiagaraEmitterImporter::InitializeRuntime(UObject* Asset) {
+#if UE5_4_BEYOND
+	for (const FNiagaraVersion& Version : FNiagaraVersions::All(Asset)) {
+		if (Version.Struct != FVersionedNiagaraEmitterData::StaticStruct()) continue;
+		auto* Data = static_cast<FVersionedNiagaraEmitterData*>(Version.Data);
+
+#if REFLECTION_NIAGARA_ALLOCATION_ESTIMATOR
+		// Deserializing VersionData bypasses initialization of the lock taken by the first tick.
+		FNiagaraRuntimeEstimation::Access(Data).Init();
+#endif
+#if STATS
+		Data->GetStatData().Init();
+#endif
+	}
+#endif
 }
 
 void INiagaraEmitterImporter::RestoreVersions(UObject* Asset, FUObjectExportContainer* Container) {
@@ -173,6 +251,7 @@ void INiagaraEmitterImporter::RestoreVersions(UObject* Asset, FUObjectExportCont
 	int32 Pads = 0;
 	int32 Made = 0;
 	int32 Unplaced = 0;
+	int32 EmptyRendererSlots = 0;
 
 	/* Taken in turn, so no two versions end up sharing one of something they each want */
 	int32 NextPad = 0;
@@ -210,17 +289,23 @@ void INiagaraEmitterImporter::RestoreVersions(UObject* Asset, FUObjectExportCont
 				continue;
 			}
 
-			const bool bStanding = Inner.IsEmpty()
-				? FNiagaraVersions::GetObject(Version, *Field) != nullptr
-				: FNiagaraVersions::GetObjectIn(Version, *Field, *Inner) != nullptr;
+			UObject* Standing = ReadScriptSlot(Version, Field, Inner);
+			// Niagara constructs default scripts before the cooked properties are read. An omitted
+			// slot can therefore hold a template script with no source even though the real script is exported.
+			if (Standing != nullptr && (Scripts.Contains(Standing) || SourceOfScript(Standing) != nullptr || ScriptSource == nullptr)) continue;
 
-			if (bStanding) continue;
+			// The optional editor package can retain a GPU script even for a CPU emitter.
+			if (Field == TEXT("GPUComputeScript") && UsesCpuSimulation(Version)) continue;
 
-			const bool bSet = Inner.IsEmpty()
-				? FNiagaraVersions::SetObject(Version, *Field, Script)
-				: FNiagaraVersions::SetObjectIn(Version, *Field, *Inner, Script);
+			if (WriteScriptSlot(Version, Field, Inner, Script)) Hung++;
+		}
 
-			if (bSet) Hung++;
+		// Older versions store a separate flag. Match it to the cooked spawn script before PostLoad.
+		if (const FBoolProperty* Interpolated = FindFProperty<FBoolProperty>(Version.Struct, TEXT("bInterpolatedSpawning"))) {
+			const FString Usage = UsageOf(FNiagaraVersions::GetObjectIn(Version, TEXT("SpawnScriptProps"), TEXT("Script")));
+			if (Usage == TEXT("ParticleSpawnScript") || Usage == TEXT("ParticleSpawnScriptInterpolated")) {
+				Interpolated->SetPropertyValue_InContainer(Version.Data, Usage == TEXT("ParticleSpawnScriptInterpolated"));
+			}
 		}
 
 		if (FNiagaraVersions::GetObject(Version, TEXT("EditorData")) == nullptr && EditorData.IsValidIndex(NextEditorData)) {
@@ -246,6 +331,9 @@ void INiagaraEmitterImporter::RestoreVersions(UObject* Asset, FUObjectExportCont
 			Drawn += FNiagaraVersions::SetObjects(Version, TEXT("RendererProperties"), Mine);
 		}
 
+		/* Keep the serialized renderer selection, with empty slots removed before Niagara caches it. */
+		EmptyRendererSlots += RemoveEmptyRendererSlots(Version);
+
 		/* The scratch pads hold the scripts written inside the emitter rather than beside it.
 		 *
 		 * The containers are in the package, sitting under the emitter, but it is the version that
@@ -269,6 +357,10 @@ void INiagaraEmitterImporter::RestoreVersions(UObject* Asset, FUObjectExportCont
 		}
 	}
 
+	if (EmptyRendererSlots > 0) {
+		UE_LOG(LogReflection, Display, TEXT("\"%s\" removed %d empty Niagara renderer slot(s)"), *Asset->GetName(), EmptyRendererSlots);
+	}
+
 	if (Unplaced > 0) {
 		FImportIssues::Report(
 			EImportIssue::Data,
@@ -279,8 +371,80 @@ void INiagaraEmitterImporter::RestoreVersions(UObject* Asset, FUObjectExportCont
 		);
 	}
 
+#if UE5_1_BEYOND && WITH_EDITORONLY_DATA
+	/* No version is left with a source that has no graph.
+	 *
+	 * The emitter's PostLoad hands each version's source straight to the graph it holds
+	 * (UNiagaraScriptSource::ForceGraphToRecompileOnNextCheck is NodeGraph-> without a check), so a
+	 * source saved without one crashes the editor on load or open. An empty graph is a source with
+	 * nothing in it; the missing one is reported, since what was in it did not come across. */
+	int32 Emptied = 0;
+
+	for (const FNiagaraVersion& Version : Versions) {
+		UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(FNiagaraVersions::GetObject(Version, TEXT("GraphSource")));
+
+		if (Source == nullptr || Source->NodeGraph != nullptr) continue;
+
+		Source->NodeGraph = NewObject<UNiagaraGraph>(Source, NAME_None, RF_Transactional);
+
+		Emptied++;
+	}
+
+	if (Emptied > 0) {
+		FImportIssues::Report(
+			EImportIssue::Data,
+			TEXT("Niagara emitter source graph is missing"),
+			FString::Printf(
+				TEXT("'%s' had %d version(s) whose source came across without its graph, so each was given an empty one rather than left to crash the editor when it is opened."),
+				*Asset->GetName(), Emptied)
+		);
+	}
+#endif
+
 	UE_LOG(LogReflection, Display, TEXT("\"%s\" restored %d script(s), %d renderer(s) and %d scratch pad(s) across %d version(s)"),
 		*Asset->GetName(), Hung, Drawn, Pads + Made, Versions.Num());
+}
+
+void INiagaraEmitterImporter::RepairSavedScripts(UObject* Asset) {
+#if UE5_1_BEYOND && WITH_EDITORONLY_DATA
+	if (Asset == nullptr || Asset->GetOutermost()->bIsCookedForEditor) return;
+	TArray<UObject*> Emitters;
+	if (UNiagaraSystem* System = Cast<UNiagaraSystem>(Asset)) {
+		if (INiagaraSystemImporter::RestorePreviewPlaybackRange(*System)) {
+			System->MarkPackageDirty();
+			UE_LOG(LogReflection, Display, TEXT("\"%s\" restored the Niagara preview playback range"), *System->GetName());
+		}
+		GetObjectsWithOuter(System, Emitters, true);
+	} else if (Asset->IsA<UNiagaraEmitter>()) Emitters.Add(Asset);
+	else return;
+
+	int32 Restored = 0;
+	for (UObject* Emitter : Emitters) {
+		if (!Emitter->IsA<UNiagaraEmitter>()) continue;
+		TArray<UObject*> Children;
+		GetObjectsWithOuter(Emitter, Children, false);
+		for (const FNiagaraVersion& Version : FNiagaraVersions::All(Emitter)) {
+			const UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(FNiagaraVersions::GetObject(Version, TEXT("GraphSource")));
+			if (Source == nullptr || Source->NodeGraph == nullptr) continue;
+
+			for (UObject* Child : Children) {
+				UNiagaraScript* Script = Cast<UNiagaraScript>(Child);
+				if (Script == nullptr || Script->GetLatestSource() != Source) continue;
+				FString Field, Inner;
+				if (!SlotFor(UsageOf(Script), Field, Inner)) continue;
+				const UNiagaraScript* Standing = Cast<UNiagaraScript>(ReadScriptSlot(Version, Field, Inner));
+				// Older imports kept the exported script next to a generated script with a missing source.
+				if (Standing == nullptr || Standing->GetLatestSource() != nullptr
+					|| Standing->GetUsage() != Script->GetUsage() || Standing->GetUsageId() != Script->GetUsageId()) continue;
+				if (WriteScriptSlot(Version, Field, Inner, Script)) Restored++;
+			}
+		}
+	}
+	if (Restored > 0) {
+		Asset->MarkPackageDirty();
+		UE_LOG(LogReflection, Display, TEXT("\"%s\" reattached %d exported Niagara script(s) before opening"), *Asset->GetName(), Restored);
+	}
+#endif
 }
 
 void INiagaraEmitterImporter::Validate(UObject* Asset) const {

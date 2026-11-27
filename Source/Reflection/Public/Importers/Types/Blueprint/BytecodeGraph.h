@@ -215,6 +215,9 @@ private:
 	bool HasLocal(const FString& Name) const;
 
 	/* Points a delegate node at the delegate it is about, and answers what it is asked against */
+	bool PrepareDelegate(class UK2Node_BaseMCDelegate* Node, const FUObjectJsonValueExport& Named);
+	void RemoveCallsWithMissingInputs();
+
 	UEdGraphPin* PointAtDelegate(class UK2Node_BaseMCDelegate* Node, const FUObjectJsonValueExport& Named);
 
 	/* Asks the delegate node it pointed against, or, when that is a local only written further down,
@@ -481,6 +484,9 @@ private:
 	/* Calls laid down with nothing wired to them yet, and the function each one calls. What reads a
 	 * value is placed after what works it out, and a jump reaches a call later still, so these are
 	 * only said to be left out once everything has had its chance to wire into them. */
+	TArray<class UK2Node_CallFunction*> ImportedCalls;
+	TArray<class UK2Node_CreateDelegate*> CreatedDelegates;
+
 	TArray<TPair<TWeakObjectPtr<UK2Node>, FString>> Unwired;
 
 	int32 LastChainedAddress = -1;

@@ -5,7 +5,9 @@
 #include "CoreMinimal.h"
 
 struct FUObjectExportContainer;
+class UObjectSerializer;
 class UPropertySerializer;
+class UNiagaraScript;
 
 /* What putting the graphs back together came to */
 struct FNiagaraGraphStats {
@@ -36,7 +38,10 @@ struct FNiagaraGraphStats {
 class REFLECTION_API FNiagaraGraphs {
 public:
 	static bool HasSerializedPins(const FUObjectExportContainer* Container);
+	static void PrepareExports(FUObjectExportContainer& Container, UObjectSerializer& Serializer);
 
 	static void Rebuild(FUObjectExportContainer* Container, UPackage* Package,
 		UPropertySerializer* Serializer, FNiagaraGraphStats& OutStats);
+	static void RestoreOutputUsage(UNiagaraScript& Script, bool bInferUsage = false);
+	static void ReportMissingScriptVersions(const FUObjectExportContainer& Container);
 };

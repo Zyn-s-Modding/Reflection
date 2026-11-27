@@ -13,8 +13,12 @@ struct REFLECTION_API FTextureImport {
 	/* Fetches an export and its pixels from Cloud, then builds the asset */
 	static bool FromCloud(const FString& Path, const FString& FetchPath, UTexture*& OutTexture);
 
+	/* The same, from the raw export answer already fetched for FetchPath, so a caller that had to
+	 * ask for it to find out it was a texture does not ask a second time */
+	static bool FromResponse(const TSharedPtr<FJsonObject>& Response, const FString& Path, const FString& FetchPath, UTexture*& OutTexture);
+
 	/* Builds the asset from an export and a payload already in hand */
-	static bool FromExport(const TSharedPtr<FJsonObject>& Export, const FString& Path, const FString& Type, TArray<uint8> Data, UTexture*& OutTexture);
+	static bool FromExport(const TSharedPtr<FJsonObject>& Export, const FString& Path, const FString& Type, TArray<uint8> Data, UTexture*& OutTexture, bool bVolumeSource = false);
 };
 
 /* Basic template importer using Asset Class. */

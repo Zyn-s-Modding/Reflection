@@ -13,6 +13,8 @@
 #endif
 
 #include "Animation/PoseAsset.h"
+#include "Animation/AnimSequence.h"
+#include "Importers/Types/Animation/PoseAssetImporter.h"
 #include "Engine/EngineUtilities.h"
 #include "Utilities/JsonHelpers.h"
 
@@ -79,6 +81,64 @@ namespace {
 	void LoadMeshLodImportedData(const USkeletalMesh* Mesh, const int32 Lod, FSkeletalMeshImportData& Out) { Mesh->LoadLODImportedData(Lod, Out); }
 	void SaveMeshLodImportedData(USkeletalMesh* Mesh, const int32 Lod, FSkeletalMeshImportData& In) { Mesh->SaveLODImportedData(Lod, In); }
 #endif
+	UPoseAsset* FindLegacyPoseOwner(UObject* Existing) {
+		const UAnimSequence* Sequence = Cast<UAnimSequence>(Existing);
+		if (Sequence == nullptr) return nullptr;
+
+		const UPackage* Package = Sequence->GetOutermost();
+		if (FPackageName::GetShortName(Package->GetName()) != Sequence->GetName()) return nullptr;
+
+		const FString PosePath = Package->GetName() + TEXT("_PoseAsset");
+		UPoseAsset* Pose = LoadObjectByPath<UPoseAsset>(PosePath);
+		if (Pose == nullptr || Pose->SourceAnimation != Sequence) return nullptr;
+
+		// Other packages may refer to the old path. Leave those collisions for a regular asset rename.
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		if (Registry.IsLoadingAssets()) return nullptr;
+
+		TArray<FName> Referencers;
+		Registry.GetReferencers(Package->GetFName(), Referencers);
+		for (const FName& Referencer : Referencers) {
+			if (Referencer != Pose->GetOutermost()->GetFName() && Referencer != Package->GetFName()) return nullptr;
+		}
+		return Pose;
+	}
+
+	bool RestoreMeshName(USkeletalMesh& Mesh, const FName AssetName) {
+		if (Mesh.GetFName() == AssetName) return true;
+
+		UPackage* OldPackage = Mesh.GetOutermost();
+		UObject* Existing = FindObject<UObject>(OldPackage, *AssetName.ToString());
+		UPoseAsset* Pose = FindLegacyPoseOwner(Existing);
+		if (Pose == nullptr) return false;
+
+		FString NewName;
+		UPackage* NewPackage = IPoseAssetImporter::CreateSourceAnimationPackage(*Pose, false, NewName);
+		if (NewPackage == nullptr) return false;
+
+		const FString PreviousPath = Existing->GetPathName();
+		const FName TemporaryMeshName = Mesh.GetFName();
+		const ERenameFlags Flags = REN_DontCreateRedirectors | REN_NonTransactional | REN_ForceNoResetLoaders;
+		if (!Existing->Rename(*NewName, NewPackage, Flags)) return false;
+
+		if (!Mesh.Rename(*AssetName.ToString(), OldPackage, Flags)) {
+			Existing->Rename(*AssetName.ToString(), OldPackage, Flags);
+			return false;
+		}
+
+		Existing->MarkPackageDirty();
+		Pose->MarkPackageDirty();
+		if (GetSettings()->AssetSettings.SaveAssets && (!SavePackage(NewPackage) || !SavePackage(Pose->GetOutermost()))) {
+			Mesh.Rename(*TemporaryMeshName.ToString(), OldPackage, Flags);
+			Existing->Rename(*AssetName.ToString(), OldPackage, Flags);
+			return false;
+		}
+
+		FAssetRegistryModule::AssetRenamed(Existing, PreviousPath);
+		UE_LOG(LogReflection, Display, TEXT("Moved the generated pose animation from %s to %s"), *PreviousPath, *Existing->GetPathName());
+		return true;
+	}
+
 }
 
 UObject* ISkeletalMeshImporter::CreateAsset(UObject* CreatedAsset) {
@@ -92,15 +152,27 @@ UObject* ISkeletalMeshImporter::CreateAsset(UObject* CreatedAsset) {
 	 *
 	 * Moved aside rather than destroyed: whatever is still drawing the old mesh keeps a mesh that
 	 * is still there to draw, and it goes on its own once nothing is. */
-	if (UObject* Existing = StaticFindObjectFast(USkeletalMesh::StaticClass(), GetPackage(), StringToName(GetAssetName()))) {
-		Existing->Rename(
+	const FName AssetName = StringToName(GetAssetName());
+	FName MeshName = AssetName;
+	if (UObject* Existing = StaticFindObjectFast(UObject::StaticClass(), GetPackage(), AssetName)) {
+		if (!Existing->IsA<USkeletalMesh>()) {
+			if (FindLegacyPoseOwner(Existing) == nullptr) {
+				FImportIssues::Report(EImportIssue::Failed, TEXT("Skeletal mesh name is already taken"), Existing->GetFullName());
+				return nullptr;
+			}
+
+			// Leave the animation and its references intact until the replacement mesh has built.
+			MeshName = MakeUniqueObjectName(GetPackage(), USkeletalMesh::StaticClass(), FName(TEXT("ReflectionMesh")));
+		} else if (!Existing->Rename(
 			nullptr,
 			GetTransientPackage(),
 			REN_ForceNoResetLoaders | REN_DoNotDirty | REN_DontCreateRedirectors | REN_NonTransactional
-		);
+		)) {
+			return nullptr;
+		}
 	}
 
-	return IImporter::CreateAsset(NewObject<USkeletalMesh>(GetPackage(), USkeletalMesh::StaticClass(), *GetAssetName(), RF_Public | RF_Standalone));
+	return IImporter::CreateAsset(NewObject<USkeletalMesh>(GetPackage(), USkeletalMesh::StaticClass(), MeshName, RF_Public | RF_Standalone));
 }
 
 /* A half built mesh is still drawn.
@@ -830,6 +902,12 @@ bool ISkeletalMeshImporter::Import() {
 
 		SkeletalMesh->SetQualityLevelMinLod(MinQualityLevelLod);
 #endif
+	}
+
+	if (!RestoreMeshName(*SkeletalMesh, StringToName(GetAssetName()))) {
+		FImportIssues::Report(EImportIssue::Failed, TEXT("Could not move the legacy pose animation"), GetAssetName());
+		Abandon(SkeletalMesh);
+		return false;
 	}
 
 	SkeletalMesh->CalculateInvRefMatrices();

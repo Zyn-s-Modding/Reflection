@@ -44,6 +44,7 @@ public:
     UPropertySerializer* PropertySerializer;
 
     TArray<TSharedPtr<FJsonValue>> Exports;
+    TSet<const FUObjectExport*> SkippedExports;
 
     UPROPERTY()
     TArray<FString> ExportsToNotDeserialize;

@@ -13,6 +13,10 @@
 #include "Serializers/VolumeBrush.h"
 #include "Serializers/FoliageActor.h"
 #include "Importers/Constructor/ImportIssues.h"
+#include "Importers/Constructor/Asset.h"
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+#include "Misc/ScopeExit.h"
 #include "Engine/Log.h"
 #include "InstancedFoliageActor.h"
 #include "UObject/Package.h"
@@ -211,7 +215,7 @@ UObject* UObjectSerializer::SpawnExport(FUObjectExport* Export, const bool bOnly
 	 *
 	 * Unless the caller only wants it read into, which is how the templated importer fills the asset
 	 * it just made. */
-	if (!bOnlySerialize && ExportsToNotDeserialize.Contains(Export->GetName().ToString())) {
+	if (!bOnlySerialize && (SkippedExports.Contains(Export) || ExportsToNotDeserialize.Contains(Export->GetName().ToString()))) {
 		if (Export->Object == nullptr) {
 			if (UObject** Standing = ConstructedObjects.Find(Export->GetName().ToString())) {
 				Export->Object = *Standing;
@@ -485,7 +489,7 @@ void UObjectSerializer::DeserializeExport(FUObjectExport* Export, TMap<TSharedPt
 	const FString Type = ExportObject->GetStringField(TEXT("Type")).Replace(TEXT("CommonWidgetSwitcher"), TEXT("CommonActivatableWidgetSwitcher"));
 		
 	/* Check if it's not supposed to be deserialized */
-	if (ExportsToNotDeserialize.Contains(Name)) return;
+	if (SkippedExports.Contains(Export) || ExportsToNotDeserialize.Contains(Name)) return;
 	if (Type == "BodySetup" || Type == "NavCollision") return;
 
 	FString ClassName = ExportObject->GetStringField(TEXT("Class"));
@@ -818,6 +822,15 @@ void UObjectSerializer::DeserializeObjectProperties(const TSharedPtr<FJsonObject
 
 	const UClass* ObjectClass = Object->GetClass();
 
+	if (Properties.IsValid()) FImportIssues::ReportUnplacedFields(ObjectClass, *Properties);
+
+	/* What a graph references is part of what the graph is (the function a node calls, the enum a
+	 * pin is typed by), so it is fetched with Import References off as well: see ConstructAsset */
+	const bool bGraphPart = Object->IsA<UEdGraphNode>() || Object->IsA<UEdGraph>()
+		|| ObjectClass->GetName().StartsWith(TEXT("NiagaraScriptVariable"));
+	if (bGraphPart) FAssetUtilities::GraphDependencyDepth++;
+	ON_SCOPE_EXIT { if (bGraphPart) FAssetUtilities::GraphDependencyDepth--; };
+
 	/* Watched rather than trusted: reading one property can fetch, compile, and take this object apart underneath the loop */
 	const TWeakObjectPtr<UObject> Alive(Object);
 
@@ -863,6 +876,15 @@ void UObjectSerializer::DeserializeObjectProperties(const TSharedPtr<FJsonObject
 #endif
 
 		if (!HasHandledProperty && PropertyName != "LODParentPrimitive" && PropertyName != "bIsCookedForEditor") {
+			/* Called something else by the source (Resources/ReflectionFields.json) */
+			if (Properties.IsValid() && !Properties->HasField(PropertyName)) {
+				if (const TSharedPtr<FJsonValue> Aliased = FImportIssues::AliasedValue(ObjectClass, PropertyName, *Properties); Aliased.IsValid()) {
+					FJsonObject Renamed;
+					Renamed.SetField(PropertyName, Aliased);
+					PropertySerializer->DeserializePropertyField(Property, Renamed, PropertyName, Object, Object);
+					continue;
+				}
+			}
 			PropertySerializer->DeserializePropertyField(Property, *Properties, PropertyName, Object, Object);
 		}
 	}

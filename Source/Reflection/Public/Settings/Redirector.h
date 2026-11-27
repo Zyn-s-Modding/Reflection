@@ -10,15 +10,15 @@ USTRUCT()
 struct FRRedirectorPoint {
 	GENERATED_BODY()
 public:
-	/* Substring to match in the path (case-sensitive).
-	 * Supports folder, package, or full asset paths.
-	 * Example: "/Game/A/" */
+	/* Case-insensitive match.
+	 * Start with '/' to match a complete path prefix.
+	 * Omit it to replace the first occurrence inside the path. */
 	UPROPERTY(EditAnywhere, Config, Category = RedirectorPoint)
 	FString From;
 
-	/* Substring that replaces `From` when matched.
-	 * Replaces all occurrences in the path.
-	 * Example: "/Game/B/" */
+	/* Replacement for the matching part of the path.
+	 * A prefix may name a mount or a folder.
+	 * Example: "/Zynifier/" */
 	UPROPERTY(EditAnywhere, Config, Category = RedirectorPoint)
 	FString To;
 };
@@ -84,10 +84,12 @@ struct FRRedirectPreview {
 
 /* Redirect Handler */
 struct FRRedirects {
-	static TMap<FString, TArray<FRRedirectorPoint>> History;
+	static TMap<FString, FString> History;
 
 	static void Clear();
-	static void Redirect(FString& Path);
+	/* When Path is a folder, pass the full original package path as AlternatePackage.
+	 * An asset reference may also pass the package it would have if split apart. */
+	static void Redirect(FString& Path, const FString& AlternatePackage = FString());
 	static void Reverse(FString& Path);
 
 	/* Where a path would end up, for anything that only means to show it.

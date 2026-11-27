@@ -21,4 +21,12 @@ public:
 	 * bOutFiltered, which is not the same as failing: the type is only known once the export is
 	 * down, so the request happens either way. */
 	static REFLECTION_API bool Import(const FString& InPath, const TSet<FString>& AllowedTypes = TSet<FString>(), bool* bOutFiltered = nullptr);
+
+	/* The package path Import asks Cloud for, out of whatever was pasted. Empty where nothing is left. */
+	static REFLECTION_API FString ToPackagePath(const FString& InPath);
+
+	/* Has a run's paths fetched ahead of it, in the order Import will reach them. Call
+	 * FCloudPrefetch::AdvanceRun once per path as the run moves past each, inside an
+	 * FCloudPrefetch::FScope held for the whole run. */
+	static REFLECTION_API void QueueAhead(const TArray<FString>& Paths);
 };

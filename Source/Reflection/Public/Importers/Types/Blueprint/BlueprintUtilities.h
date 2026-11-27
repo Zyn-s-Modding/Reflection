@@ -10,6 +10,7 @@
 #include "Importers/Constructor/Importer.h"
 #include "Modules/Toolbar/Tools/ImportFromPath.h"
 #include "UObject/CoreRedirects.h"
+#include "Misc/ScopeExit.h"
 
 /* 4.25 and below build this module without the engine's shared PCH (see Reflection.Build.cs),
  * which is where the blueprint function library type used to come in from */
@@ -145,85 +146,47 @@ inline TSubclassOf<UObject> LoadClassFromPath(const FString& ObjectName, const F
 	return nullptr;
 }
 
-inline TSubclassOf<UObject> LoadBlueprintClass(FString& ObjectPath) {
-	const FString& ProjectName = GReflectionRuntime.Profile.ProjectName;
-
-	if (!ProjectName.IsEmpty()) {
-		ObjectPath = ObjectPath.Replace(*(ProjectName + "/Content"), TEXT("/Game"));
-	}
-	
-	FString FullPath = ObjectPath; 
-	if (FullPath.EndsWith(TEXT(".1"))) {
-		FullPath = FullPath.LeftChop(2);
+inline UClass* LoadBlueprintClass(const FString& PackagePath) {
+	if (const UBlueprint* Blueprint = LoadObjectByPath<UBlueprint>(PackagePath)) {
+		return Blueprint->GeneratedClass;
 	}
 
-	if (UObject* LoadedObject = LoadObjectByPath<UObject>(FullPath)) {
-		const UBlueprint* LoadedBlueprint = Cast<UBlueprint>(LoadedObject);
-		
-		if (LoadedBlueprint && LoadedBlueprint->GeneratedClass) {
-			return LoadedBlueprint->GeneratedClass;
-		}
+	const FString ClassPath = PackagePath + TEXT(".") + FPackageName::GetShortName(PackagePath) + TEXT("_C");
+	return LoadObjectByPath<UClass>(ClassPath);
+}
 
-		/* The class it generated, where the blueprint cannot say: answering nothing reads as an asset the project has not got */
-		if (FString Leaf = FullPath; Leaf.Split(TEXT("/"), nullptr, &Leaf, ESearchCase::CaseSensitive, ESearchDir::FromEnd)) {
-			if (UClass* Generated = LoadObjectByPath<UClass>(FullPath + TEXT(".") + Leaf + TEXT("_C"))) {
-				return Generated;
-			}
-		}
+inline UClass* LoadOrImportBlueprintClass(const FString& ObjectPath) {
+	const FString SourcePath = TToolImportFromPath::ToPackagePath(ObjectPath);
+	if (SourcePath.IsEmpty()) return nullptr;
+
+	FString PackagePath;
+	if (!FAssetUtilities::TryGetEngineContentDestination(SourcePath, PackagePath)) {
+		PackagePath = ToEditorPackagePath(SourcePath);
 	}
 
-	return nullptr;
+	if (UClass* Loaded = LoadBlueprintClass(PackagePath)) return Loaded;
+	if (PackageHoldsAsset(PackagePath)) return nullptr;
+
+	// Recursive parent imports must stop if the export points back to a class already being resolved.
+	static TSet<FString> ActivePackages;
+	if (ActivePackages.Contains(PackagePath)) return nullptr;
+	ActivePackages.Add(PackagePath);
+	ON_SCOPE_EXIT { ActivePackages.Remove(PackagePath); };
+
+	// Mirror needs the source package even when the editor puts the asset under a redirect.
+	return TToolImportFromPath::Import(SourcePath) ? LoadBlueprintClass(PackagePath) : nullptr;
 }
 
 inline UClass* LoadClass(const TSharedPtr<FJsonObject>& SuperStruct) {
-	FString ObjectName = SuperStruct->GetStringField(TEXT("ObjectName")).Replace(TEXT("Class'"), TEXT("")).Replace(TEXT("'"), TEXT(""));
-	FString ObjectPath = SuperStruct->GetStringField(TEXT("ObjectPath"));
-
-	/* Redirected by the same rules an asset path is, since a class is named the same way */
-	{
-		FString Named = ObjectPath.Contains(TEXT(".")) ? ObjectPath : ObjectPath + TEXT(".") + ObjectName;
-
-		FRRedirects::Redirect(Named);
-
-		if (int32 Dot; Named.FindLastChar(TEXT('.'), Dot)) {
-			ObjectPath = Named.Left(Dot);
-			ObjectName = Named.RightChop(Dot + 1);
-
-			/* A blueprint names its generated class, the asset with _C after it */
-			if (!ObjectPath.Contains(TEXT("/Script/")) && !ObjectName.EndsWith(TEXT("_C"))) {
-				ObjectPath = Named;
-			}
-		}
+	const FString ObjectPath = SuperStruct->GetStringField(TEXT("ObjectPath"));
+	if (ObjectPath.StartsWith(TEXT("/Script/"))) {
+		FString ClassName = StripObjectOuter(SuperStruct->GetStringField(TEXT("ObjectName")));
+		FString Module = ObjectPath;
+		ObjectPath.Split(TEXT("."), &Module, &ClassName);
+		return LoadClassFromPath(ClassName, Module);
 	}
 
-	/* It's a C++ class if it has Script in it */
-	if (ObjectPath.Contains("/Script/")) {
-		return LoadClassFromPath(ObjectName, ObjectPath);
-	}
-	
-	ObjectPath.Split(".", &ObjectPath, nullptr);
-
-	if (UClass* Made = LoadBlueprintClass(ObjectPath)) {
-		return Made;
-	}
-
-	/* The blueprint a class says it comes from, which the project has not got yet.
-	 *
-	 * A class read without finding its parent is left parented to nothing, and a blueprint in that
-	 * state is one the editor can make nothing of: everything it inherited resolves to nothing and
-	 * the asset opens broken. The parent is an asset like any other, so it is asked for, and the
-	 * class it generates is the one this one comes from.
-	 *
-	 * It reaches back as far as it needs to. A parent that is itself a blueprint asks for its own
-	 * parent as it is read, and the chain ends where it meets a class written in C++, which is
-	 * already here and never asked for. */
-	/* Only where the project has not got it: one that is here and did not answer is written over every time anything names it */
-
-	if (!PackageHoldsAsset(ObjectPath) && TToolImportFromPath::Import(ObjectPath)) {
-		return LoadBlueprintClass(ObjectPath);
-	}
-
-	return nullptr;
+	return LoadOrImportBlueprintClass(ObjectPath);
 }
 
 /* What a class or a struct says it comes from, under whichever name it is written as.

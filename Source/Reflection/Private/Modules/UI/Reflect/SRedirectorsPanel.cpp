@@ -407,7 +407,7 @@ TSharedRef<SWidget> SRedirectorsPanel::BuildRule(const int32 Index, const int32 
 		[
 			SNew(SEditableTextBox)
 			.HintText(LOCTEXT("FromHint", "/Game/From/"))
-			.ToolTipText(LOCTEXT("FromTooltip", "Matched anywhere in the path, the first time it appears. A folder needs its slashes or it matches halfway through a name."))
+			.ToolTipText(LOCTEXT("FromTooltip", "Start with / to match a path prefix, such as /Game. Omit it to match the first occurrence inside the path."))
 			.Text(FText::FromString(Point.From))
 			.OnTextCommitted_Lambda([this, Index, At](const FText& NewText, ETextCommit::Type) {
 				UReflectionSettings* Changed = GetSettings();

@@ -10,11 +10,12 @@
 #include "Engine/VolumeTexture.h"
 #include "Factories/TextureFactory.h"
 #include "Factories/TextureRenderTargetFactoryNew.h"
+#include "Math/Float16.h"
 #include "Settings/Runtime.h"
 #include "Engine/EngineUtilities.h"
 #include "Utilities/JsonHelpers.h"
 
-bool FTextureCreator::Create(const FString& Type, const TSharedPtr<FJsonObject>& Export, TArray<uint8>& Data, UTexture*& OutTexture) {
+bool FTextureCreator::Create(const FString& Type, const TSharedPtr<FJsonObject>& Export, TArray<uint8>& Data, UTexture*& OutTexture, const bool bVolumeSource) {
 	if (Type == TEXT("Texture2D")) {
 		return CreateTexture2D<UTexture2D>(OutTexture, Data, Export);
 	}
@@ -34,7 +35,7 @@ bool FTextureCreator::Create(const FString& Type, const TSharedPtr<FJsonObject>&
 	}
 
 	if (Type == TEXT("VolumeTexture")) {
-		return CreateVolumeTexture(OutTexture, Data, Export);
+		return CreateVolumeTexture(OutTexture, Data, Export, bVolumeSource);
 	}
 
 	if (Type == TEXT("TextureRenderTarget2D")) {
@@ -214,34 +215,111 @@ bool FTextureCreator::CreateTextureCube(UTexture*& OutTextureCube, TArray<uint8>
 	return true;
 }
 
-bool FTextureCreator::CreateVolumeTexture(UTexture*& OutVolumeTexture, TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export) {
-	if (!RequireRawMipData(TEXT("A volume"))) {
-		return false;
+namespace ReflectionVolumeSource {
+	constexpr int32 HeaderSize = 20;
+
+	/* RVT version 1 uses fixed source format codes and little-endian dimensions. */
+	bool ReadHeader(const TArray<uint8>& Data, FTextureCookedLayout& OutMip) {
+		if (Data.Num() < HeaderSize || FMemory::Memcmp(Data.GetData(), "RVT\1", 4) != 0) {
+			return false;
+		}
+
+		const auto ReadUInt = [&Data](const int32 Offset) {
+			return uint32(Data[Offset]) | (uint32(Data[Offset + 1]) << 8)
+				| (uint32(Data[Offset + 2]) << 16) | (uint32(Data[Offset + 3]) << 24);
+		};
+
+		switch (ReadUInt(16)) {
+			case 1: OutMip.Source.SourceFormat = TSF_BGRA8; OutMip.Source.BytesPerVoxel = 4; break;
+			case 2: OutMip.Source.SourceFormat = TSF_G8; OutMip.Source.BytesPerVoxel = 1; break;
+			case 3: OutMip.Source.SourceFormat = TSF_RGBA16; OutMip.Source.BytesPerVoxel = 8; break;
+			case 4: OutMip.Source.SourceFormat = TSF_RGBA16F; OutMip.Source.BytesPerVoxel = 8; break;
+			case 5:
+#if UE5_4_BEYOND
+				OutMip.Source.SourceFormat = TSF_RGBA32F;
+#else
+				OutMip.Source.SourceFormat = TSF_RGBA16F;
+#endif
+				OutMip.Source.BytesPerVoxel = 16;
+				break;
+			default:
+				return false;
+		}
+
+		const uint32 SizeX = ReadUInt(4);
+		const uint32 SizeY = ReadUInt(8);
+		const uint32 SizeZ = ReadUInt(12);
+		const uint64 SliceVoxels = uint64(SizeX) * SizeY;
+		const int32 PayloadSize = Data.Num() - HeaderSize;
+		const uint64 Voxels = PayloadSize / OutMip.Source.BytesPerVoxel;
+		if (SliceVoxels == 0 || SizeZ == 0 || PayloadSize % OutMip.Source.BytesPerVoxel != 0
+			|| Voxels % SliceVoxels != 0 || Voxels / SliceVoxels != SizeZ) {
+			return false;
+		}
+
+		OutMip.SizeX = SizeX;
+		OutMip.SizeY = SizeY;
+		OutMip.SizeZ = SizeZ;
+		return true;
+	}
+}
+
+bool FTextureCreator::CreateVolumeTexture(UTexture*& OutVolumeTexture, const TArray<uint8>& Data, const TSharedPtr<FJsonObject>& Export, const bool bVolumeSource) {
+	FTextureCookedLayout Cooked;
+	FTextureCookedLayout Mip;
+
+	if (bVolumeSource) {
+		if (!ReflectionVolumeSource::ReadHeader(Data, Mip)) {
+			UE_LOG(LogReflection, Error, TEXT("Invalid volume texture payload for \"%s\""), *AssetName);
+			return false;
+		}
+
+		Export->TryGetNumberField(TEXT("SizeX"), Cooked.SizeX);
+		Export->TryGetNumberField(TEXT("SizeY"), Cooked.SizeY);
+		int64 MipPayload;
+		GetFirstMipDescription(Export, Cooked.SizeZ, MipPayload);
+	} else {
+		if (!IsRawMipData()) {
+			UE_LOG(LogReflection, Error, TEXT("Update Mirror to import volume texture \"%s\" on this platform"), *AssetName);
+			return false;
+		}
+
+		if (!GetCookedLayout(Export, 0, Cooked)) {
+			return false;
+		}
+		Cooked.SlicesHalvePerMip = true;
 	}
 
 	UVolumeTexture* VolumeTexture = NewObject<UVolumeTexture>(Package, UVolumeTexture::StaticClass(), *AssetName, RF_Public | RF_Standalone);
-
 	DeserializeTexture(VolumeTexture, Export);
-	SetPlatformData(VolumeTexture, new FTexturePlatformData());
-
-	/* Depth varies per asset, so fall back to reading it off the width */
-	FTextureCookedLayout Cooked;
-	if (!GetCookedLayout(Export, 0, Cooked)) {
-		return false;
-	}
-
-	Cooked.SlicesHalvePerMip = true;
-
-	if (FTexturePlatformData* PlatformData = GetPlatformData(VolumeTexture)) {
-		PlatformData->PixelFormat = Cooked.PixelFormat;
-	}
 
 	if (HasSingleMip(Export)) {
 		VolumeTexture->MipGenSettings = TMGS_NoMipmaps;
 	}
 
-	if (!BuildSourceFromRawMip(VolumeTexture, Data, Cooked)) {
+	if (bVolumeSource) {
+		const uint8* Voxels = Data.GetData() + ReflectionVolumeSource::HeaderSize;
+#if !UE5_4_BEYOND
+		TArray<FFloat16> HalfVoxels;
+		if (Mip.Source.BytesPerVoxel == 16) {
+			const int32 NumChannels = (Data.Num() - ReflectionVolumeSource::HeaderSize) / sizeof(float);
+			HalfVoxels.SetNumUninitialized(NumChannels);
+			for (int32 Index = 0; Index < NumChannels; ++Index) {
+				float Value;
+				FMemory::Memcpy(&Value, Voxels + Index * sizeof(float), sizeof(float));
+				HalfVoxels[Index] = Value;
+			}
+			Voxels = reinterpret_cast<const uint8*>(HalfVoxels.GetData());
+		}
+#endif
+		VolumeTexture->Source.Init(Mip.SizeX, Mip.SizeY, Mip.SizeZ, 1, Mip.Source.SourceFormat, Voxels);
+		ReportReducedMip(VolumeTexture, Cooked, Mip);
+	} else if (!BuildSourceFromRawMip(VolumeTexture, Data, Cooked)) {
 		return false;
+	}
+
+	if (VolumeTexture->LODGroup == 255) {
+		VolumeTexture->LODGroup = TEXTUREGROUP_World;
 	}
 
 	OutVolumeTexture = VolumeTexture;
@@ -303,7 +381,7 @@ bool FTextureCookedLayout::DropMip() {
 	/* Block compressed data bottoms out at a single block, and the decoders count whole blocks */
 	const int32 Smallest = Source.BlockDim;
 
-	if (SizeX <= Smallest && SizeY <= Smallest) {
+	if (SizeX <= Smallest && SizeY <= Smallest && (!SlicesHalvePerMip || SizeZ == 1)) {
 		return false;
 	}
 
@@ -359,7 +437,7 @@ bool FTextureCreator::GetCookedLayout(const TSharedPtr<FJsonObject>& Export, con
 	FString PixelFormatName;
 	Export->TryGetStringField(TEXT("PixelFormat"), PixelFormatName);
 
-	if (MipPayload > 0 && FTextureFormats::GetLayout(FTextureFormats::FromName(PixelFormatName), Layout)
+	if (MipSlices <= 1 && MipPayload > 0 && FTextureFormats::GetLayout(FTextureFormats::FromName(PixelFormatName), Layout)
 		&& Layout.GetEncodedSliceSize(SizeX, ReportedSizeY) == MipPayload) {
 		SizeY = ReportedSizeY / Slices;
 
@@ -460,11 +538,33 @@ bool FTextureCreator::BuildSourceFromRawMip(UTexture* Texture, const TArray<uint
 		}
 	}
 
-	/* A texture that came out at a fraction of the size it was cooked at is a wrong asset rather
-	 * than a note in passing: it imports, it looks right in a thumbnail, and it is soft everywhere
-	 * it gets used. Said as loudly as anything that failed outright, and put on the report so it
-	 * is still there once the log has scrolled. */
-	if (Mip.SizeX != Cooked.SizeX) {
+	ReportReducedMip(Texture, Cooked, Mip);
+
+	TUniquePtr<uint8[]> Decoded;
+	const uint8* SourceData = Data.GetData();
+	if (Mip.Source.RequiresDecode) {
+		const int64 EncodedSliceSize = Mip.Source.GetEncodedSliceSize(Mip.SizeX, Mip.SizeY);
+		const int64 DecodedSliceSize = Mip.Source.GetDecodedSliceSize(Mip.SizeX, Mip.SizeY);
+		Decoded.Reset(new uint8[DecodedSliceSize * Mip.SizeZ]);
+
+		for (int32 SliceIndex = 0; SliceIndex < Mip.SizeZ; SliceIndex++) {
+			FTextureFormats::Decode(Data.GetData() + EncodedSliceSize * SliceIndex,
+				Decoded.Get() + DecodedSliceSize * SliceIndex, Mip.SizeX, Mip.SizeY, DecodedSliceSize, Mip.PixelFormat);
+		}
+		SourceData = Decoded.Get();
+	}
+
+	Texture->Source.Init(Mip.SizeX, Mip.SizeY, Mip.SizeZ, 1, Mip.Source.SourceFormat, SourceData);
+
+	if (Texture->LODGroup == 255) {
+		Texture->LODGroup = TEXTUREGROUP_World;
+	}
+
+	return true;
+}
+
+void FTextureCreator::ReportReducedMip(UTexture* Texture, const FTextureCookedLayout& Cooked, const FTextureCookedLayout& Mip) const {
+	if (Mip.SizeX < Cooked.SizeX || Mip.SizeY < Cooked.SizeY || Mip.SizeZ < Cooked.SizeZ) {
 		UE_LOG(LogReflection, Error, TEXT("\"%s\" only had mip data down at %d x %d x %d, importing that instead of %d x %d x %d"), *AssetName, Mip.SizeX, Mip.SizeY, Mip.SizeZ, Cooked.SizeX, Cooked.SizeY, Cooked.SizeZ);
 
 		FImportIssues::ReportFor(
@@ -479,40 +579,6 @@ bool FTextureCreator::BuildSourceFromRawMip(UTexture* Texture, const TArray<uint
 			TEXT("The mips above that one weren't in a mounted pak, so this is all there was to import.")
 		);
 	}
-
-	const int64 EncodedSliceSize = Mip.Source.GetEncodedSliceSize(Mip.SizeX, Mip.SizeY);
-	const int64 DecodedSliceSize = Mip.Source.GetDecodedSliceSize(Mip.SizeX, Mip.SizeY);
-
-	uint8* SourceData = static_cast<uint8*>(FMemory::Malloc(DecodedSliceSize * Mip.SizeZ));
-
-	for (int32 SliceIndex = 0; SliceIndex < Mip.SizeZ; SliceIndex++) {
-		const uint8* EncodedSlice = Data.GetData() + EncodedSliceSize * SliceIndex;
-		uint8* DecodedSlice = SourceData + DecodedSliceSize * SliceIndex;
-
-		if (Mip.Source.RequiresDecode) {
-			FTextureFormats::Decode(EncodedSlice, DecodedSlice, Mip.SizeX, Mip.SizeY, DecodedSliceSize, Mip.PixelFormat);
-		} else {
-			FMemory::Memcpy(DecodedSlice, EncodedSlice, DecodedSliceSize);
-		}
-	}
-
-	Texture->Source.Init(Mip.SizeX, Mip.SizeY, Mip.SizeZ, 1, Mip.Source.SourceFormat, SourceData);
-
-	FMemory::Free(SourceData);
-
-	if (Texture->LODGroup == 255) {
-		Texture->LODGroup = TEXTUREGROUP_World;
-	}
-
-	Texture->UpdateResource();
-
-	/* An import keeps the editor drawn while it waits on the Cloud, so the renderer is drawing the
-	 * whole time this runs, and updating a texture swaps the resource a material has already cached
-	 * the handles of. Waited on here, so the swap is finished before the next thing drawn can read
-	 * what a material points at. */
-	FlushRenderingCommands();
-
-	return true;
 }
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Deserialization ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
@@ -520,10 +586,31 @@ bool FTextureCreator::BuildSourceFromRawMip(UTexture* Texture, const TArray<uint
 void FTextureCreator::DeserializeTexture(UTexture* Texture, const TSharedPtr<FJsonObject>& Export) const {
 	if (Texture == nullptr) return;
 
-	GetObjectSerializer()->DeserializeObjectProperties(RemovePropertiesShared(GetProperties(Export), {
+	const TSharedPtr<FJsonObject> Properties = RemovePropertiesShared(GetProperties(Export), {
 		"ImportedSize",
 		"LODBias"
-	}), Texture);
+	});
+	FString Group;
+	if (Properties->TryGetStringField(TEXT("LODGroup"), Group)) {
+		Group.RemoveFromStart(TEXT("TextureGroup::"));
+		if (Group.StartsWith(TEXT("TEXTUREGROUP_Project"))) {
+			const UEnum* Groups = StaticEnum<TextureGroup>();
+			bool bAvailable = false;
+			for (int32 Index = 0; Index < Groups->NumEnums(); ++Index) {
+				if (Groups->GetNameStringByIndex(Index) == Group) {
+					bAvailable = true;
+					break;
+				}
+			}
+			// Project groups select local device profile settings. Keep the target default if absent.
+			if (!bAvailable) {
+				Properties->RemoveField(TEXT("LODGroup"));
+				UE_LOG(LogReflection, Display, TEXT("\"%s\" uses the target LOD group because %s is unavailable"), *AssetName, *Group);
+			}
+		}
+	}
+
+	GetObjectSerializer()->DeserializeObjectProperties(Properties, Texture);
 }
 
 void FTextureCreator::DeserializeTexture2D(UTexture2D* Texture2D, const TSharedPtr<FJsonObject>& Export) const {
