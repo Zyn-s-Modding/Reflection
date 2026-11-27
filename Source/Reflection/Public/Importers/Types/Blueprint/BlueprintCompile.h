@@ -11,6 +11,13 @@ class UBlueprint;
 REFLECTION_API bool CompileBlueprintGuarded(UBlueprint* Blueprint,
 	EBlueprintCompileOptions Options = EBlueprintCompileOptions::None);
 
+/* Mends or takes out the nodes a compile that failed complained about, and compiles again, until the
+ * class compiles or nothing more can be done. For once a blueprint is finished being built: earlier,
+ * a node complained about may only be waiting on something still to come. Answers how many nodes it
+ * changed. */
+REFLECTION_API int32 RepairBlueprintCompile(UBlueprint* Blueprint,
+	EBlueprintCompileOptions Options = EBlueprintCompileOptions::SkipGarbageCollection);
+
 /* Whether the class a blueprint ended up with is one the engine can make an object of.
  *
  * A compile that failed leaves the generated class half built: no constructor, nothing to be

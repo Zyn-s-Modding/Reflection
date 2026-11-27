@@ -5,6 +5,9 @@
 #include "CoreMinimal.h"
 #include "Redirector.generated.h"
 
+class FJsonObject;
+class FJsonValue;
+
 /* A point in a redirector */
 USTRUCT()
 struct FRRedirectorPoint {
@@ -20,6 +23,25 @@ public:
 	 * A prefix may name a mount or a folder.
 	 * Example: "/Zynifier/" */
 	UPROPERTY(EditAnywhere, Config, Category = RedirectorPoint)
+	FString To;
+};
+
+/* A field the export calls one thing and this project's property calls another */
+USTRUCT()
+struct FRPropertyRedirect {
+	GENERATED_BODY()
+public:
+	/* The class or struct this is kept to, along with everything derived from it. Named without
+	 * the prefix, such as "FortItemDefinition". Empty for every type. */
+	UPROPERTY(EditAnywhere, Config, Category = PropertyRedirect)
+	FString Type;
+
+	/* The field as the export names it */
+	UPROPERTY(EditAnywhere, Config, Category = PropertyRedirect)
+	FString From;
+
+	/* The property here it is read into. Only where the export has no field of this name. */
+	UPROPERTY(EditAnywhere, Config, Category = PropertyRedirect)
 	FString To;
 };
 
@@ -58,6 +80,11 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category = Redirector)
 	TArray<FRRedirectorPoint> Points;
 
+	/* Fields read into a property of another name. The first one in order with a field the export
+	 * has is the one used. */
+	UPROPERTY(EditAnywhere, Config, Category = Redirector)
+	TArray<FRPropertyRedirect> Properties;
+
 private:
 	/* Optional whitelist of profile names that can use this redirector.
 	 * Compared against the current cloud profile (exact match).
@@ -92,10 +119,26 @@ struct FRRedirects {
 	static void Redirect(FString& Path, const FString& AlternatePackage = FString());
 	static void Reverse(FString& Path);
 
+	/* Every path the game could keep an asset at that would land at Path here, most likely first.
+	 *
+	 * Reverse only knows what this session redirected, so an asset imported in an earlier session
+	 * can't be turned back into the path Cloud answers to by it. This runs each redirect point
+	 * backwards instead, along with the engine content folder, and keeps each path that a redirect
+	 * forwards takes back to Path. More than one point can lead to the same place, so there can be
+	 * more than one answer; whoever asks Cloud takes the first one it has. Path itself isn't listed. */
+	static TArray<FString> Sources(const FString& Path);
+
 	/* Where a path would end up, for anything that only means to show it.
 	 *
 	 * Redirect keeps a history so a moved path can be turned back into the one Cloud answers to.
 	 * Nothing is being imported here, so there would be nothing to turn back, and a history entry
 	 * for a path that was never fetched is one Reverse can later find instead of the real one. */
 	static FRRedirectPreview Preview(const FString& Path);
+
+	/* What the property redirects have for a property of Type, out of the fields the export
+	 * wrote. Null where none of them has anything for it. */
+	static TSharedPtr<FJsonValue> RedirectedProperty(const UStruct* Type, const FString& Property, const FJsonObject& Fields);
+
+	/* Whether a redirect reads this field into a property Type has, so it isn't being left out */
+	static bool PlacesField(const UStruct* Type, const FString& Field);
 };

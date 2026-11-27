@@ -11,6 +11,9 @@
 #include "Modules/Toolbar/Tools/ImportFromPath.h"
 #include "UObject/CoreRedirects.h"
 #include "Misc/ScopeExit.h"
+#include "Interfaces/IPluginManager.h"
+#include "Engine/Log.h"
+#include "Modules/ModuleManager.h"
 
 /* 4.25 and below build this module without the engine's shared PCH (see Reflection.Build.cs),
  * which is where the blueprint function library type used to come in from */
@@ -124,6 +127,53 @@ inline void ReadStructMemberContext(const FUObjectJsonValueExport& Variable, FSt
 	}
 }
 
+/* Loads the code module a /Script path names, where it is in the project but not loaded yet.
+ *
+ * A game feature's modules only load when the game turns the feature on, which an editor importing
+ * never does, so every class one declares looks like a class the project has not got. The plugin
+ * that holds the module is mounted the way the feature would be, which loads its modules, and the
+ * module is asked for by name if that did not. Answers whether the module is loaded afterwards. */
+inline bool BringInScriptModule(const FString& ScriptPath) {
+	FString Module = ScriptPath;
+
+	if (!Module.RemoveFromStart(TEXT("/Script/"))) return false;
+
+	Module.Split(TEXT("."), &Module, nullptr);
+
+	if (Module.IsEmpty()) return false;
+
+	const FName ModuleName(*Module);
+
+	if (FModuleManager::Get().IsModuleLoaded(ModuleName)) return true;
+
+	/* Asked once a module: one that will not load does not start loading on the second try */
+	static TSet<FName> Tried;
+
+	if (Tried.Contains(ModuleName)) return false;
+
+	Tried.Add(ModuleName);
+
+	for (const TSharedRef<IPlugin>& Plugin : IPluginManager::Get().GetDiscoveredPlugins()) {
+		const bool bHolds = Plugin->GetDescriptor().Modules.ContainsByPredicate([&ModuleName](const FModuleDescriptor& One) {
+			return One.Name == ModuleName;
+		});
+
+		if (!bHolds) continue;
+
+		const bool bMounted = IPluginManager::Get().MountExplicitlyLoadedPlugin(Plugin->GetName());
+
+		UE_LOG(LogReflection, Display, TEXT("module \"%s\" is in plugin \"%s\", which %s"), *Module, *Plugin->GetName(), bMounted ? TEXT("is now mounted") : TEXT("would not mount"));
+
+		break;
+	}
+
+	if (!FModuleManager::Get().IsModuleLoaded(ModuleName) && FModuleManager::Get().ModuleExists(*Module)) {
+		FModuleManager::Get().LoadModule(ModuleName);
+	}
+
+	return FModuleManager::Get().IsModuleLoaded(ModuleName);
+}
+
 inline TSubclassOf<UObject> LoadClassFromPath(const FString& ObjectName, const FString& ObjectPath) {
 	const FString FullPath = ObjectPath + TEXT(".") + ObjectName;
 
@@ -140,6 +190,13 @@ inline TSubclassOf<UObject> LoadClassFromPath(const FString& ObjectName, const F
 	if (Now != Named) {
 		if (UClass* Renamed = LoadObjectByPath<UClass>(Now.ToString())) {
 			return Renamed;
+		}
+	}
+
+	/* Declared by a module that is there but was never loaded, which once loaded has it */
+	if (BringInScriptModule(ObjectPath)) {
+		if (UClass* Brought = LoadObjectByPath<UClass>(FullPath)) {
+			return Brought;
 		}
 	}
 

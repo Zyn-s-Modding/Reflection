@@ -393,6 +393,11 @@ void FImportIssues::MarkFieldHandled(const FString& TypeName, const FString& Fie
 }
 
 TSharedPtr<FJsonValue> FImportIssues::AliasedValue(const UStruct* Type, const FString& Property, const FJsonObject& Fields) {
+	/* What the user redirected comes ahead of what the plugin already knows */
+	if (const TSharedPtr<FJsonValue> Redirected = FRRedirects::RedirectedProperty(Type, Property, Fields); Redirected.IsValid()) {
+		return Redirected;
+	}
+
 	ReadKnownFields();
 	for (const UStruct* Each = Type; Each != nullptr; Each = Each->GetSuperStruct()) {
 		const FFieldAlias* Alias = FieldAliases().Find(Each->GetName() + TEXT(".") + Property);
@@ -443,6 +448,7 @@ void FImportIssues::ReportUnplacedFields(const UStruct* Type, const FJsonObject&
 		if (Type->FindPropertyByName(FName(*Key)) != nullptr) continue;
 		if (Type->FindPropertyByName(FName(*(Key + TEXT("_DEPRECATED")))) != nullptr) continue;
 		if (IsHandled(Type, Key)) continue;
+		if (FRRedirects::PlacesField(Type, Key)) continue;
 		if (const FString* By = RebuiltBy(Type, Key)) {
 			Rebuilt.AddUnique(Key);
 			if (!By->IsEmpty()) RebuiltBy_.AddUnique(*By);

@@ -16,6 +16,7 @@
 #include "Modules/UI/Reflect/SReflectPathsDialog.h"
 #include "Engine/EngineUtilities.h"
 #include "Settings/Blacklist.h"
+#include "Settings/Redirector.h"
 #include "Utilities/ContentBrowser.h"
 
 void TToolImportFromPath::Execute() {
@@ -127,7 +128,7 @@ void TToolImportFromPath::QueueAhead(const TArray<FString>& Paths) {
 }
 
 bool TToolImportFromPath::Import(const FString& InPath, const TSet<FString>& AllowedTypes, bool* bOutFiltered) {
-	const FString PackagePath = ToPackagePath(InPath);
+	FString PackagePath = ToPackagePath(InPath);
 
 	if (PackagePath.IsEmpty()) {
 		return false;
@@ -193,7 +194,34 @@ bool TToolImportFromPath::Import(const FString& InPath, const TSet<FString>& All
 		FText::FromString(PackagePath)
 	));
 
-	const TSharedPtr<FJsonObject> Response = Cloud::Export::GetRawBlocking(PackagePath);
+	TSharedPtr<FJsonObject> Response = Cloud::Export::GetRawBlocking(PackagePath);
+
+	/* A path in this project, such as an asset right-clicked in the Content Browser, is where a
+	 * redirect put the asset rather than where the game keeps it, and Cloud only answers to the
+	 * game's. Each path that redirects here is asked for in turn, and the first Cloud has is the
+	 * one reflected; the redirect then puts it back where it was. */
+	const auto HasExports = [](const TSharedPtr<FJsonObject>& Answer) {
+		const TArray<TSharedPtr<FJsonValue>>* Listed = nullptr;
+		return Answer.IsValid() && Answer->TryGetArrayField(TEXT("exports"), Listed) && Listed->Num() > 0;
+	};
+
+	if (!HasExports(Response)) {
+		for (const FString& Source : FRRedirects::Sources(PackagePath)) {
+			if (FRBlacklist::IsPathBlacklisted(Source, AssetName, &Blacklisted)) continue;
+
+			TSharedPtr<FJsonObject> Answer = Cloud::Export::GetRawBlocking(Source);
+
+			if (!HasExports(Answer)) continue;
+
+			UE_LOG(LogReflection, Display, TEXT("\"%s\" is reflected from \"%s\", the path the game keeps it at"), *PackagePath, *Source);
+
+			PackagePath = Source;
+			Response = MoveTemp(Answer);
+
+			break;
+		}
+	}
+
 	if (Response == nullptr || !Response->HasField(TEXT("exports"))) {
 		ReportUnreachable(EImportIssue::MissingAsset, TEXT("Cloud has nothing at this path"));
 

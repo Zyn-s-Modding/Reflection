@@ -3,6 +3,9 @@
 #include "Importers/Types/Materials/MaterialFunctionImporter.h"
 #include "RenderingThread.h"
 #include "Factories/MaterialFunctionFactoryNew.h"
+#if !UE4_25_BELOW
+#include "MaterialEditingLibrary.h"
+#endif
 
 /* 4.25 and below build this module without the engine's shared PCH (see Reflection.Build.cs),
  * which is where the material function type used to come in from */
@@ -32,6 +35,9 @@ UObject* IMaterialFunctionImporter::CreateAsset(UObject* CreatedAsset) {
 }
 
 bool IMaterialFunctionImporter::Import() {
+	/* Reflected again over one already loaded, so loaded materials were compiled against the old one */
+	const bool bWasLoaded = FindObject<UMaterialFunction>(GetPackage(), *GetAssetName()) != nullptr;
+
 	UMaterialFunction* MaterialFunction = Create<UMaterialFunction>();
 
 	/* Empty all expressions, we create them */
@@ -99,7 +105,19 @@ bool IMaterialFunctionImporter::Import() {
 	MaterialFunction->PreEditChange(nullptr);
 	MaterialFunction->PostEditChange();
 
+	/* A material keeps the shader map it compiled against the function's old expressions, and
+	 * nothing about rebuilding the function tells it otherwise: one that failed to compile against
+	 * the old ones (and draws as the world grid) goes on failing until the editor restarts. The
+	 * material editor recompiles every loaded material and instance using a function it applies;
+	 * this is that same call. Only on a function reflected again, since a new one has nothing
+	 * compiled against it, and a material still being built around it is not to be recompiled. */
+#if !UE4_25_BELOW
+	if (bWasLoaded) {
+		UMaterialEditingLibrary::UpdateMaterialFunction(MaterialFunction, nullptr);
+	}
+#endif
+
 	Save();
-	
+
 	return true;
 }

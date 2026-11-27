@@ -4,6 +4,7 @@
 #include "NiagaraWeightedIntArray.h"
 
 #include "Engine/EngineUtilities.h"
+#include "Importers/Constructor/Asset.h"
 #include "Importers/Constructor/Importer.h"
 #include "Serializers/PropertySerializer.h"
 
@@ -43,6 +44,34 @@ namespace {
 		const FName Outer = Export->GetOuterTree();
 		return Outer.IsNone() ? Export->GetName() : NiagaraObjectPath(Outer.ToString() + TEXT(":") + Export->GetName().ToString());
 	}
+
+#if UE5_4_BEYOND && WITH_EDITORONLY_DATA
+	/* The game's own copy of an engine script, where it holds a revision the engine's doesn't.
+	 *
+	 * A call names the revision of the module it was built against. The engine ships the modules
+	 * too, so the reference resolves to the engine's copy, and an older engine's copy can stop at
+	 * an earlier revision: the call is then run against a module with other inputs and other
+	 * outputs. Dynamic Material Parameters is the case that shows: from 2.1 it can write its
+	 * values under its own name (Particles.<Module>.DynamicMaterialParameter) for a renderer to
+	 * bind, and the 1.x module writes Particles.DynamicMaterialParameter only, so the renderer
+	 * reads an attribute nothing writes and the material gets zero.
+	 *
+	 * The game's copy is fetched into the project's engine content folder, where any engine asset
+	 * the import brings in goes, and used only if it has the revision asked for. Where engine
+	 * content isn't redirected there is nowhere for it to go, and the call keeps the engine's
+	 * latest revision as before. */
+	UNiagaraScript* GameCopyHolding(const UNiagaraScript& Script, const FGuid& Version) {
+		const FString Package = Script.GetPackage()->GetName();
+
+		FString Destination;
+		if (!FAssetUtilities::TryGetEngineContentDestination(Package, Destination)) return nullptr;
+
+		UNiagaraScript* Copy = Cast<UNiagaraScript>(IImporter::DownloadWrapper(TObjectPtr<UObject>(), TEXT("NiagaraScript"), Script.GetName(), Package).Get());
+		if (Copy == nullptr || Copy == &Script || Copy->GetScriptData(Version) == nullptr) return nullptr;
+
+		return Copy;
+	}
+#endif
 
 	/* What a pin says of itself, given either as the text or as the pieces it was made from */
 	FText TextOf(const TSharedPtr<FJsonValue>& Value) {
@@ -1110,6 +1139,7 @@ void FNiagaraGraphs::Rebuild(FUObjectExportContainer* Container, UPackage* Packa
 	 * Said here with both names in it, because a call is only wrong by what it points at. */
 #if WITH_EDITORONLY_DATA
 	int32 RemappedVersions = 0;
+	TSet<FString> FromGame;
 	for (FUObjectExport* Export : Container->Exports) {
 		UNiagaraNodeFunctionCall* Call = Cast<UNiagaraNodeFunctionCall>(Export->Object);
 
@@ -1118,8 +1148,13 @@ void FNiagaraGraphs::Rebuild(FUObjectExportContainer* Container, UPackage* Packa
 #if UE5_4_BEYOND
 		if (UNiagaraScript* Script = Call->FunctionScript; Script != nullptr && Call->SelectedScriptVersion.IsValid()
 			&& Script->GetScriptData(Call->SelectedScriptVersion) == nullptr) {
-			Call->SelectedScriptVersion = Script->GetExposedVersion().VersionGuid;
-			RemappedVersions++;
+			if (UNiagaraScript* Copy = GameCopyHolding(*Script, Call->SelectedScriptVersion)) {
+				Call->FunctionScript = Copy;
+				FromGame.Add(Copy->GetPathName());
+			} else {
+				Call->SelectedScriptVersion = Script->GetExposedVersion().VersionGuid;
+				RemappedVersions++;
+			}
 		}
 #endif
 		const UNiagaraGraph* Called = CalledGraphOf(Call);
@@ -1154,6 +1189,13 @@ void FNiagaraGraphs::Rebuild(FUObjectExportContainer* Container, UPackage* Packa
 	if (RemappedVersions > 0) {
 		FImportIssues::Report(EImportIssue::Data, TEXT("Niagara calls used the available script version"),
 			FString::Printf(TEXT("%d call(s) selected a revision missing from the target editor."), RemappedVersions));
+	}
+	if (FromGame.Num() > 0) {
+		TArray<FString> Listed = FromGame.Array();
+		Listed.Sort();
+		UE_LOG(LogReflection, Display, TEXT("Niagara calls that asked for revisions the engine's scripts don't have now call the game's copies: %s"), *FString::Join(Listed, TEXT(", ")));
+		FImportIssues::Report(EImportIssue::Data, TEXT("Niagara calls asked for script revisions the engine doesn't have, and use the game's copies of those scripts"),
+			FString::Join(Listed, TEXT(", ")));
 	}
 #endif
 

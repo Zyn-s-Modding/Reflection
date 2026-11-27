@@ -110,6 +110,28 @@ void FAssetUtilities::FlushSaves() {
 	}
 }
 
+/* Makes sure there is somewhere for a plugin's assets to go.
+ *
+ * A plugin the project has not got is made, as a plugin that only holds content. One it has but has
+ * not mounted is mounted: a game feature loads itself only when the game asks for it, so its content
+ * folder is not a place packages can be made until then, and an asset of its comes back as not a
+ * package path at all. */
+static void EnsurePluginMounted(const FString& PluginName, const FString& Destination) {
+	const TSharedPtr<IPlugin> Plugin = GetPlugin(PluginName);
+
+	if (Plugin == nullptr) {
+		if (FAssetUtilities::IsAllowedDestination(Destination)) CreatePlugin(PluginName);
+
+		return;
+	}
+
+	if (Plugin->CanContainContent() && !FPackageName::MountPointExists(TEXT("/") + PluginName + TEXT("/")) && FAssetUtilities::IsAllowedDestination(Destination)) {
+		const bool bMounted = IPluginManager::Get().MountExplicitlyLoadedPlugin(PluginName);
+
+		UE_LOG(LogReflection, Display, TEXT("plugin \"%s\" was there but not mounted, %s"), *PluginName, bMounted ? TEXT("and is now") : TEXT("and would not mount"));
+	}
+}
+
 /* CreateAssetPackage Implementations ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 UPackage* FAssetUtilities::CreateAssetPackage(const FString& Path) {
 	/* A path off disk rather than a package path gets this far when the export was reflected from
@@ -195,11 +217,14 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString
 				FString RemainingPath;
 				/* PluginName = TestName */
 				/* RemainingPath = SetupAssets/Materials */
-				ModifiablePath.Split("/Content/", &PluginName, &RemainingPath, ESearchCase::IgnoreCase, ESearchDir::FromStart);
+				/* A folder that is the plugin's content itself ends in /Content with nothing after it */
+				const FString Splitting = ModifiablePath.EndsWith(TEXT("/Content")) ? ModifiablePath + TEXT("/") : ModifiablePath;
+				Splitting.Split("/Content/", &PluginName, &RemainingPath, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 				PluginName.Split("/", nullptr, &PluginName, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
 
-				/* /PluginName/Materials */
-				ModifiablePath = PluginName + "/" + RemainingPath;
+				/* /PluginName/Materials, or /PluginName alone for an asset kept at the top of the
+				 * plugin's content, which joined the same way comes out with a doubled slash */
+				ModifiablePath = RemainingPath.IsEmpty() ? PluginName : PluginName + "/" + RemainingPath;
 			}
 			/* Content/SecondaryFolder -> Game/SecondaryFolder */
 			else {
@@ -216,9 +241,7 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString
 				ModifiablePath.Split("/", nullptr, &PluginName, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 				PluginName.Split("/", &PluginName, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 
-				if (GetPlugin(PluginName) == nullptr) {
-					if (IsAllowedDestination(ModifiablePath)) CreatePlugin(PluginName);
-				}
+				EnsurePluginMounted(PluginName, ModifiablePath);
 			}
 		}
 		else {
@@ -229,9 +252,7 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString
 				ModifiablePath.Split("/", nullptr, &PluginName, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 				PluginName.Split("/", &PluginName, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 
-				if (GetPlugin(PluginName) == nullptr) {
-					if (IsAllowedDestination(ModifiablePath)) CreatePlugin(PluginName);
-				}
+				EnsurePluginMounted(PluginName, ModifiablePath);
 			}
 		}
 	} else {
@@ -240,8 +261,8 @@ UPackage* FAssetUtilities::CreateAssetPackage(const FString& Name, const FString
 			RootName.Split("/", &RootName, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromStart);
 		}
 
-		if (RootName != "Game" && RootName != "Engine" && GetPlugin(RootName) == nullptr) {
-			if (IsAllowedDestination(ModifiablePath)) CreatePlugin(RootName);
+		if (RootName != "Game" && RootName != "Engine") {
+			EnsurePluginMounted(RootName, ModifiablePath);
 		}
 
 		ModifiablePath.Split("/", &ModifiablePath, nullptr, ESearchCase::IgnoreCase, ESearchDir::FromEnd);

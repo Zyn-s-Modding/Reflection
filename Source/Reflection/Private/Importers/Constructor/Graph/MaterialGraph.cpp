@@ -6,14 +6,24 @@
 
 /* Expressions */
 #include "Materials/MaterialExpressionComment.h"
+#include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionReroute.h"
 #include "Materials/MaterialExpressionGetMaterialAttributes.h"
 #include "Materials/MaterialExpressionSetMaterialAttributes.h"
 /* FCustomPrimitiveData, for how many data floats this engine gives a primitive */
 #include "SceneTypes.h"
 #include "Engine/EngineUtilities.h"
+#include "Engine/Log.h"
 #include "Importers/Constructor/ImportIssues.h"
 #include "Utilities/JsonHelpers.h"
+
+#include "Dom/JsonObject.h"
+#include "HAL/FileManager.h"
+#include "Interfaces/IPluginManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 
 #if ENGINE_UE5
 #include "Materials/MaterialExpressionTextureBase.h"
@@ -157,6 +167,7 @@ void IMaterialGraph::PropagateExpressions(FUObjectExportContainer* Container) {
 
 		GetObjectSerializer()->DeserializeObjectProperties(Properties, Expression);
 		ClampCustomPrimitiveDataIndex(Expression);
+		RewriteMissingShaderCalls(Expression);
 		SetExpressionParent(Parent, Expression, Properties);
 
 		AddExpressionToParent(Parent, Expression);
@@ -213,6 +224,188 @@ void IMaterialGraph::ClampCustomPrimitiveDataIndex(UMaterialExpression* Expressi
 		*Expression->GetName(), Index, LastIndex
 	));
 #endif
+}
+
+/* Shader functions custom code calls ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * A custom expression is HLSL the game wrote against its own engine's shader library, and the
+ * library is not the same on every engine: a later one reads a scene texture through
+ * SceneTextureLookupCommon(Parameters, UV, Index, bFiltered), which an earlier one doesn't have.
+ * The material then fails its shader compile and draws as the default world grid material.
+ *
+ * What a function became is data, in Resources/MaterialShaderCalls.json: the function to call
+ * instead, and which of the original arguments it takes. A rule is used only when this engine's
+ * own shader sources never name the function, so an engine that has it keeps the call as the
+ * game wrote it. */
+namespace {
+	struct FShaderCallRule {
+		FString Becomes;
+		TArray<int32> Arguments;
+	};
+
+	const TMap<FString, FShaderCallRule>& ShaderCallRules() {
+		static const TMap<FString, FShaderCallRule> Rules = [] {
+			TMap<FString, FShaderCallRule> Read;
+			const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Reflection"));
+			const FString File = Plugin.IsValid() ? Plugin->GetBaseDir() / TEXT("Resources/MaterialShaderCalls.json") : FString();
+			FString Text;
+			TSharedPtr<FJsonObject> Root;
+			const TSharedPtr<FJsonObject>* Calls = nullptr;
+			if (File.IsEmpty() || !FFileHelper::LoadFileToString(Text, *File) || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Root)
+				|| !Root.IsValid() || !Root->TryGetObjectField(TEXT("Calls"), Calls)) {
+				UE_LOG(LogReflection, Warning, TEXT("Shader call rules could not be read from \"%s\"; custom material code is kept as written"), *File);
+				return Read;
+			}
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Calls)->Values) {
+				const TSharedPtr<FJsonObject>* Entry = nullptr;
+				const TArray<TSharedPtr<FJsonValue>>* Arguments = nullptr;
+				FShaderCallRule Rule;
+				if (!Pair.Value.IsValid() || !Pair.Value->TryGetObject(Entry) || !(*Entry)->TryGetStringField(TEXT("Becomes"), Rule.Becomes)
+					|| Rule.Becomes.IsEmpty() || Rule.Becomes == Pair.Key || !(*Entry)->TryGetArrayField(TEXT("Arguments"), Arguments)) {
+					UE_LOG(LogReflection, Warning, TEXT("Shader call rule \"%s\" in \"%s\" needs a Becomes other than itself and an Arguments list; skipped"), *Pair.Key, *File);
+					continue;
+				}
+				for (const TSharedPtr<FJsonValue>& Argument : *Arguments) {
+					double Index = -1;
+					if (Argument.IsValid() && Argument->TryGetNumber(Index) && Index >= 0) Rule.Arguments.Add(int32(Index));
+				}
+				Read.Add(Pair.Key, MoveTemp(Rule));
+			}
+			return Read;
+		}();
+		return Rules;
+	}
+
+	bool IsIdentifierChar(const TCHAR Char) {
+		return FChar::IsAlnum(Char) || Char == TCHAR('_');
+	}
+
+	/* Where Name stands as a whole identifier in Text at or after From, or INDEX_NONE */
+	int32 FindIdentifier(const FString& Text, const FString& Name, int32 From) {
+		while ((From = Text.Find(Name, ESearchCase::CaseSensitive, ESearchDir::FromStart, From)) != INDEX_NONE) {
+			const int32 End = From + Name.Len();
+			if ((From == 0 || !IsIdentifierChar(Text[From - 1])) && (End >= Text.Len() || !IsIdentifierChar(Text[End]))) return From;
+			From = End;
+		}
+		return INDEX_NONE;
+	}
+
+	/* Whether this engine's shader sources name the function anywhere. Asked once per name. */
+	bool EngineShadersName(const FString& Name) {
+		static TMap<FString, bool> Answered;
+		if (const bool* Known = Answered.Find(Name)) return *Known;
+
+		TArray<FString> Files;
+		IFileManager::Get().FindFilesRecursive(Files, *(FPaths::EngineDir() / TEXT("Shaders")), TEXT("*"), true, false);
+
+		bool bNamed = false;
+		for (const FString& File : Files) {
+			const FString Extension = FPaths::GetExtension(File);
+			if (Extension != TEXT("ush") && Extension != TEXT("usf") && Extension != TEXT("h")) continue;
+
+			FString Text;
+			if (FFileHelper::LoadFileToString(Text, *File) && FindIdentifier(Text, Name, 0) != INDEX_NONE) {
+				bNamed = true;
+				break;
+			}
+		}
+
+		Answered.Add(Name, bNamed);
+		return bNamed;
+	}
+
+	/* The arguments of the call whose opening parenthesis is at Open, split at the commas that
+	 * belong to it, and where its closing parenthesis is. False where the code ends first. */
+	bool ReadArguments(const FString& Code, const int32 Open, TArray<FString>& OutArguments, int32& OutClose) {
+		int32 Depth = 0;
+		int32 Start = Open + 1;
+		for (int32 Index = Open; Index < Code.Len(); ++Index) {
+			const TCHAR Char = Code[Index];
+			if (Char == TCHAR('(') || Char == TCHAR('[') || Char == TCHAR('{')) {
+				++Depth;
+			} else if (Char == TCHAR(')') || Char == TCHAR(']') || Char == TCHAR('}')) {
+				if (--Depth == 0) {
+					const FString Last = Code.Mid(Start, Index - Start).TrimStartAndEnd();
+					if (!Last.IsEmpty() || OutArguments.Num() > 0) OutArguments.Add(Last);
+					OutClose = Index;
+					return true;
+				}
+			} else if (Char == TCHAR(',') && Depth == 1) {
+				OutArguments.Add(Code.Mid(Start, Index - Start).TrimStartAndEnd());
+				Start = Index + 1;
+			}
+		}
+		return false;
+	}
+
+	/* Every call to Name in Code written as the rule says. The arguments kept are rewritten too,
+	 * since one call can sit inside another. Counts the calls rewritten, and the ones with fewer
+	 * arguments than the rule takes, which are left as they are. */
+	FString RewriteCalls(const FString& Code, const FString& Name, const FShaderCallRule& Rule, int32& OutRewritten, int32& OutLeft) {
+		FString Result;
+		int32 Copied = 0;
+		int32 At = 0;
+		while ((At = FindIdentifier(Code, Name, At)) != INDEX_NONE) {
+			int32 Open = At + Name.Len();
+			while (Open < Code.Len() && FChar::IsWhitespace(Code[Open])) ++Open;
+
+			TArray<FString> Arguments;
+			int32 Close = INDEX_NONE;
+			if (Open >= Code.Len() || Code[Open] != TCHAR('(') || !ReadArguments(Code, Open, Arguments, Close)) {
+				At += Name.Len();
+				continue;
+			}
+
+			TArray<FString> Taken;
+			for (const int32 Index : Rule.Arguments) {
+				if (!Arguments.IsValidIndex(Index)) break;
+				Taken.Add(RewriteCalls(Arguments[Index], Name, Rule, OutRewritten, OutLeft));
+			}
+			if (Taken.Num() != Rule.Arguments.Num()) {
+				++OutLeft;
+				At = Close + 1;
+				continue;
+			}
+
+			Result += Code.Mid(Copied, At - Copied);
+			Result += Rule.Becomes + TEXT("(") + FString::Join(Taken, TEXT(", ")) + TEXT(")");
+			Copied = Close + 1;
+			At = Copied;
+			++OutRewritten;
+		}
+		Result += Code.Mid(Copied);
+		return Result;
+	}
+}
+
+void IMaterialGraph::RewriteMissingShaderCalls(UMaterialExpression* Expression) {
+	UMaterialExpressionCustom* Custom = Cast<UMaterialExpressionCustom>(Expression);
+	if (Custom == nullptr) return;
+
+	FString Code = Custom->Code;
+	TArray<FString> Rewrote;
+	TArray<FString> Left;
+
+	for (const TPair<FString, FShaderCallRule>& Pair : ShaderCallRules()) {
+		if (FindIdentifier(Code, Pair.Key, 0) == INDEX_NONE || EngineShadersName(Pair.Key)) continue;
+
+		int32 Rewritten = 0;
+		int32 NotReached = 0;
+		Code = RewriteCalls(Code, Pair.Key, Pair.Value, Rewritten, NotReached);
+		if (Rewritten > 0) Rewrote.Add(FString::Printf(TEXT("%s as %s (x%d)"), *Pair.Key, *Pair.Value.Becomes, Rewritten));
+		if (NotReached > 0) Left.Add(FString::Printf(TEXT("%s (x%d)"), *Pair.Key, NotReached));
+	}
+
+	if (Rewrote.Num() > 0) {
+		Custom->Code = Code;
+		UE_LOG(LogReflection, Display, TEXT("\"%s\" custom code calls %s"), *Custom->GetPathName(), *FString::Join(Rewrote, TEXT(", ")));
+		FImportIssues::Report(EImportIssue::Data, TEXT("Custom material code called shader functions this engine doesn't have, and calls the ones it has instead (Resources/MaterialShaderCalls.json)"),
+			FString::Join(Rewrote, TEXT(", ")));
+	}
+	if (Left.Num() > 0) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("Custom material code calls shader functions this engine doesn't have, with fewer arguments than the rule for them takes, and was left as written"),
+			FString::Join(Left, TEXT(", ")));
+	}
 }
 
 /* Material attributes ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */

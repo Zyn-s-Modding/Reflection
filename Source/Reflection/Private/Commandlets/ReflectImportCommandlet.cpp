@@ -12,6 +12,12 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "Importers/Types/Blueprint/GraphLayout.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Interfaces/ISlateNullRendererModule.h"
+#include "Styling/AppStyle.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonWriter.h"
 
 #include "Importers/Constructor/ImportReader.h"
 #include "Importers/Constructor/Importer.h"
@@ -30,6 +36,23 @@
 #include "NiagaraNodeFunctionCall.h"
 #include "NiagaraScript.h"
 #include "NiagaraSystem.h"
+#include "FXSystem.h"
+#include "SceneInterface.h"
+#include "AssetCompilingManager.h"
+#include "ShaderCompiler.h"
+#include "ImageUtils.h"
+#include "Components/SceneCaptureComponent2D.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "NiagaraComponent.h"
+#include "NiagaraComponentSettings.h"
+#include "NiagaraDataSet.h"
+#include "NiagaraEmitterInstance.h"
+#include "NiagaraFunctionLibrary.h"
+#include "NiagaraSystemInstance.h"
+#include "NiagaraSystemInstanceController.h"
 #include "Engine/SkeletalMesh.h"
 #include "SkinnedAssetCompiler.h"
 #include "Modules/Cloud/Tools/SkeletalMeshData.h"
@@ -46,6 +69,118 @@
 #endif
 
 DECLARE_LOG_CATEGORY_CLASS(LogReflectImport, All, All);
+
+/* MetaSoundCheck.cpp: -metasoundcheck=, which looks a MetaSound over and plays it */
+bool RunMetaSoundCheck(const FString& Params, int32& OutResult);
+
+/* Writes where every node of a graph sits, how big it draws, where its pins are and what each is
+ * wired to, so a layout can be looked at without an editor window open to look at it in. Sizes are
+ * measured the same way the layout measured them. Says how many nodes sit on top of one another. */
+static void DumpGraph(const UEdGraph* Graph, const FString& Directory) {
+	TArray<const UEdGraphNode*> Nodes;
+	TMap<const UEdGraphNode*, int32> Index;
+
+	for (const UEdGraphNode* Node : Graph->Nodes) {
+		if (Node == nullptr) continue;
+
+		Index.Add(Node, Nodes.Add(Node));
+	}
+
+	TArray<FGraphNodeFootprint> Prints;
+
+	for (const UEdGraphNode* Node : Nodes) Prints.Add(MeasureGraphNode(const_cast<UEdGraphNode*>(Node)));
+
+	TArray<TSharedPtr<FJsonValue>> Written;
+
+	for (int32 At = 0; At < Nodes.Num(); ++At) {
+		const UEdGraphNode* Node = Nodes[At];
+		const FGraphNodeFootprint& Print = Prints[At];
+
+		const TSharedRef<FJsonObject> One = MakeShared<FJsonObject>();
+
+		One->SetStringField(TEXT("name"), Node->GetName());
+		One->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+		One->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+		One->SetNumberField(TEXT("x"), Node->NodePosX);
+		One->SetNumberField(TEXT("y"), Node->NodePosY);
+		One->SetNumberField(TEXT("w"), Print.Size.X);
+		One->SetNumberField(TEXT("h"), Print.Size.Y);
+		One->SetNumberField(TEXT("overhang"), Print.TopOverhang);
+		One->SetBoolField(TEXT("measured"), Print.bMeasured);
+
+		TArray<TSharedPtr<FJsonValue>> Pins;
+
+		for (const UEdGraphPin* Pin : Node->Pins) {
+			if (Pin == nullptr) continue;
+
+			const TSharedRef<FJsonObject> Held = MakeShared<FJsonObject>();
+
+			Held->SetStringField(TEXT("name"), Pin->PinName.ToString());
+			Held->SetStringField(TEXT("dir"), Pin->Direction == EGPD_Input ? TEXT("in") : TEXT("out"));
+			Held->SetStringField(TEXT("cat"), Pin->PinType.PinCategory.ToString());
+			Held->SetBoolField(TEXT("hidden"), Pin->bHidden);
+			Held->SetNumberField(TEXT("y"), Print.PinY(Pin));
+
+			TArray<TSharedPtr<FJsonValue>> Links;
+
+			for (const UEdGraphPin* Linked : Pin->LinkedTo) {
+				const int32* Other = Linked != nullptr ? Index.Find(Linked->GetOwningNode()) : nullptr;
+
+				if (Other == nullptr) continue;
+
+				const TSharedRef<FJsonObject> Link = MakeShared<FJsonObject>();
+				Link->SetNumberField(TEXT("node"), *Other);
+				Link->SetStringField(TEXT("pin"), Linked->PinName.ToString());
+
+				Links.Add(MakeShared<FJsonValueObject>(Link));
+			}
+
+			Held->SetArrayField(TEXT("links"), Links);
+
+			Pins.Add(MakeShared<FJsonValueObject>(Held));
+		}
+
+		One->SetArrayField(TEXT("pins"), Pins);
+
+		Written.Add(MakeShared<FJsonValueObject>(One));
+	}
+
+	/* Two nodes overlap where their boxes do, which is what a reader sees as one node hiding another */
+	int32 Overlaps = 0;
+
+	for (int32 A = 0; A < Nodes.Num(); ++A) {
+		for (int32 B = A + 1; B < Nodes.Num(); ++B) {
+			const double AL = Nodes[A]->NodePosX, AT = Nodes[A]->NodePosY - Prints[A].TopOverhang;
+			const double BL = Nodes[B]->NodePosX, BT = Nodes[B]->NodePosY - Prints[B].TopOverhang;
+
+			if (AL < BL + Prints[B].Size.X && BL < AL + Prints[A].Size.X && AT < BT + Prints[B].Size.Y + Prints[B].TopOverhang && BT < AT + Prints[A].Size.Y + Prints[A].TopOverhang) {
+				Overlaps++;
+			}
+		}
+	}
+
+	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("graph"), Graph->GetPathName());
+	Root->SetStringField(TEXT("class"), Graph->GetClass()->GetName());
+	Root->SetNumberField(TEXT("overlaps"), Overlaps);
+	Root->SetArrayField(TEXT("nodes"), Written);
+
+	FString Text;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Text);
+	FJsonSerializer::Serialize(Root, Writer);
+
+	FString Named = Graph->GetPathName();
+
+	for (TCHAR& Letter : Named) {
+		if (!FChar::IsAlnum(Letter)) Letter = TEXT('_');
+	}
+
+	const FString File = FPaths::Combine(Directory, Named + TEXT(".json"));
+
+	FFileHelper::SaveStringToFile(Text, *File);
+
+	UE_LOG(LogReflectImport, Display, TEXT("graph \"%s\": %d node(s), %d overlapping pair(s), written to %s"), *Graph->GetPathName(), Nodes.Num(), Overlaps, *File);
+}
 
 /* Save the generated project packages. Loading a dependency can also dirty built-in engine assets. */
 static int32 SaveDirtyPackages() {
@@ -341,6 +476,76 @@ static int32 ReportSkeletalMeshSampling(const USkeletalMesh* Mesh) {
 }
 
 int32 UReflectImportCommandlet::Main(const FString& Params) {
+	/* An ensure is logged and carried on from rather than reported. Reported from a commandlet on a Mac,
+	 * the engine starts a reporter process, trips over itself while starting it, and waits forever on
+	 * a lock it already holds, so one ensure in one asset stops every import after it. */
+	static bool bEnsuresLogged = false;
+
+	if (!bEnsuresLogged) {
+		bEnsuresLogged = true;
+
+		SetEnsureHandler([](const FEnsureHandlerArgs& Args) {
+			UE_LOG(LogReflectImport, Warning, TEXT("ensure failed, carried on: %hs %s"), Args.Expression, Args.Message);
+
+			return true;
+		});
+	}
+
+	/* -slate: Slate started with a renderer that draws nothing, so a graph is laid out against the
+	 * size each node's widget really is rather than one worked out from its pins. A commandlet starts
+	 * no Slate of its own, and without it every layout measures nodes by guesswork. The null renderer
+	 * still measures text with the real fonts, which is all a node's size comes down to. */
+	if (FParse::Param(*Params, TEXT("slate")) && !FSlateApplication::IsInitialized()) {
+		FSlateApplication::Create();
+
+		ISlateNullRendererModule& Null = FModuleManager::Get().LoadModuleChecked<ISlateNullRendererModule>(TEXT("SlateNullRenderer"));
+		FSlateApplication::Get().InitializeRenderer(Null.CreateSlateNullRenderer(), true);
+
+		/* The brushes and fonts a node is drawn with, which are the editor's rather than Slate's own */
+		FModuleManager::Get().LoadModule(TEXT("EditorStyle"));
+
+		UE_LOG(LogReflectImport, Display, TEXT("Slate started with nothing to draw to, for measuring nodes (style \"%s\")"), *FAppStyle::GetAppStyleSetName().ToString());
+	}
+
+	/* Many assets in one session, one cloud path per line of a file: -pathlist=<file>. Each is
+	 * imported as though it had been asked for with -path on its own, and the editor only starts
+	 * once, which for a project this size is most of the time a single import takes. */
+	if (FString Listed; FParse::Value(*Params, TEXT("pathlist="), Listed) && !Listed.IsEmpty()) {
+		TArray<FString> Lines;
+
+		if (!FFileHelper::LoadFileToStringArray(Lines, *Listed)) {
+			UE_LOG(LogReflectImport, Error, TEXT("there is nothing to read at \"%s\""), *Listed);
+
+			return 1;
+		}
+
+		const FString Rest = Params.Replace(*(TEXT("-pathlist=") + Listed), TEXT(""));
+
+		int32 Failed = 0;
+		int32 Done = 0;
+
+		for (const FString& Line : Lines) {
+			const FString One = Line.TrimStartAndEnd();
+
+			if (One.IsEmpty() || One.StartsWith(TEXT("#"))) continue;
+
+			UE_LOG(LogReflectImport, Display, TEXT("===== importing %d of %d: %s"), ++Done, Lines.Num(), *One);
+
+			const int32 Said = Main(Rest + TEXT(" -path=") + One);
+
+			if (Said != 0) Failed++;
+
+			UE_LOG(LogReflectImport, Display, TEXT("===== done with %s: %s"), *One, Said == 0 ? TEXT("ok") : TEXT("failed"));
+
+			/* Everything an import made is saved by now, and anything a later one needs is loaded back */
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+		}
+
+		UE_LOG(LogReflectImport, Display, TEXT("%d imported, %d failed"), Done - Failed, Failed);
+
+		return Failed > 0 ? 1 : 0;
+	}
+
 	/* Loads a skeletal mesh already in the project, the way a fresh editor session does, and says
 	 * what it can be sampled with: -meshcheck=/Mount/Path/Mesh */
 	if (FString Checked; FParse::Value(*Params, TEXT("meshcheck="), Checked) && !Checked.IsEmpty()) {
@@ -378,6 +583,214 @@ int32 UReflectImportCommandlet::Main(const FString& Params) {
 		}
 		return 0;
 	}
+
+	/* Runs a Niagara system already in the project for a while with nothing drawing it, and says
+	 * what each CPU emitter's particles hold, attribute by attribute: the mean, least and most of
+	 * each component. For telling a particle drawn black because of its material from one drawn
+	 * black because the attribute the material reads is zero, without a screen to look at:
+	 * -particleprobe=/Mount/Path/System [-probeseconds=2] */
+	if (FString Probed; FParse::Value(*Params, TEXT("particleprobe="), Probed) && !Probed.IsEmpty()) {
+		if (!Probed.Contains(TEXT("."))) {
+			Probed += TEXT(".") + FPackageName::GetShortName(Probed);
+		}
+
+		UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *Probed);
+		if (System == nullptr) {
+			UE_LOG(LogReflectImport, Error, TEXT("there is no Niagara system at \"%s\""), *Probed);
+			return 1;
+		}
+
+		System->RequestCompile(false);
+		System->WaitForCompilationComplete(true, false);
+
+		float Seconds = 2.0f;
+		FParse::Value(*Params, TEXT("probeseconds="), Seconds);
+
+		UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, TEXT("ParticleProbe"));
+		FWorldContext& Context = GEngine->CreateNewWorldContext(EWorldType::Game);
+		Context.SetCurrentWorld(World);
+
+		/* A world made in a commandlet is given no FX system (UWorld::CreateFXSystem), and a
+		 * Niagara component waits for one before it activates */
+		if (World->Scene != nullptr && World->Scene->GetFXSystem() == nullptr) {
+			World->FXSystem = FFXSystemInterface::Create(World->GetFeatureLevel(), World->Scene);
+			World->Scene->SetFXSystem(World->FXSystem);
+		}
+
+		ON_SCOPE_EXIT {
+			GEngine->DestroyWorldContext(World);
+			World->DestroyWorld(false);
+		};
+
+		/* Needs -AllowCommandletRendering: a component isn't made at all where nothing can render */
+		UNiagaraComponent* Component = UNiagaraFunctionLibrary::SpawnSystemAtLocation(World, System, FVector::ZeroVector, FRotator::ZeroRotator, FVector(1.0f), false, false, ENCPoolMethod::None, false);
+		if (Component == nullptr) {
+			UE_LOG(LogReflectImport, Error, TEXT("\"%s\" could not be spawned (pass -AllowCommandletRendering)"), *Probed);
+			return 1;
+		}
+
+		/* Nobody is looking, so nothing is close enough for scalability to keep it */
+		Component->SetAllowScalability(false);
+
+		/* User parameters the game sets as it plays, such as one an animation notify drives from a
+		 * curve: -probeuser=BurstIndex=1,BurstIndex2=1 */
+		if (FString Users; FParse::Value(*Params, TEXT("probeuser="), Users, false)) {
+			TArray<FString> Pairs;
+			Users.ParseIntoArray(Pairs, TEXT(","));
+			for (const FString& Pair : Pairs) {
+				FString Name, Value;
+				if (Pair.Split(TEXT("="), &Name, &Value)) Component->SetVariableFloat(FName(*Name), FCString::Atof(*Value));
+			}
+		}
+
+		Component->Activate(true);
+
+		UE_LOG(LogReflectImport, Display, TEXT("spawned: registered %d, ready to run %d, world ready %d, allowed %d, scene %d, active %d"),
+			Component->IsRegistered() ? 1 : 0, System->IsReadyToRun() ? 1 : 0, Component->IsWorldReadyToRun() ? 1 : 0,
+			FNiagaraComponentSettings::IsSystemAllowedToRun(System) ? 1 : 0, World->Scene != nullptr ? 1 : 0, Component->IsActive() ? 1 : 0);
+
+		const int32 Ticks = FMath::Max(1, FMath::RoundToInt(Seconds * 30.0f));
+		Component->AdvanceSimulation(Ticks, 1.0f / 30.0f);
+
+		FNiagaraSystemInstanceControllerPtr Controller = Component->GetSystemInstanceController();
+		FNiagaraSystemInstance* Instance = Controller.IsValid() ? Controller->GetSystemInstance_Unsafe() : nullptr;
+		if (Instance == nullptr) {
+			UE_LOG(LogReflectImport, Error, TEXT("\"%s\" has no running instance after %.2fs (not ready to run?)"), *Probed, Seconds);
+			return 1;
+		}
+
+		UE_LOG(LogReflectImport, Display, TEXT("particle probe of \"%s\" after %.2fs"), *Probed, Seconds);
+
+		for (const TSharedRef<FNiagaraEmitterInstance, ESPMode::ThreadSafe>& Emitter : Instance->GetEmitters()) {
+			const FNiagaraDataSet& Data = Emitter->GetData();
+			const FNiagaraDataBuffer* Buffer = Data.GetCurrentData();
+			const bool bCPU = Data.GetSimTarget() == ENiagaraSimTarget::CPUSim;
+			const int32 Count = Buffer != nullptr && bCPU ? Buffer->GetNumInstances() : Emitter->GetNumParticles();
+
+			UE_LOG(LogReflectImport, Display, TEXT("  %s: %d particle(s), %s"),
+				*Emitter->GetEmitterHandle().GetName().ToString(), Count, bCPU ? TEXT("CPU") : TEXT("GPU, not read"));
+
+			if (!bCPU || Buffer == nullptr || Count == 0) continue;
+
+			const TArray<FNiagaraVariableBase>& Variables = Data.GetVariables();
+			const TArray<FNiagaraVariableLayoutInfo>& Layouts = Data.GetVariableLayouts();
+
+			for (int32 Index = 0; Index < Variables.Num() && Index < Layouts.Num(); ++Index) {
+				const FNiagaraVariableLayoutInfo& Layout = Layouts[Index];
+				const int32 Components = Layout.GetNumFloatComponents();
+				if (Components == 0 || Components > 4) continue;
+
+				TArray<FString> Parts;
+				for (int32 Component_ = 0; Component_ < Components; ++Component_) {
+					double Sum = 0;
+					float Least = TNumericLimits<float>::Max();
+					float Most = TNumericLimits<float>::Lowest();
+					for (int32 Particle = 0; Particle < Count; ++Particle) {
+						const float Value = *Buffer->GetInstancePtrFloat(Layout.GetFloatComponentStart() + Component_, Particle);
+						Sum += Value;
+						Least = FMath::Min(Least, Value);
+						Most = FMath::Max(Most, Value);
+					}
+					Parts.Add(FString::Printf(TEXT("%.3g [%.3g..%.3g]"), Sum / Count, Least, Most));
+				}
+
+				UE_LOG(LogReflectImport, Display, TEXT("    %s = %s"), *Variables[Index].GetName().ToString(), *FString::Join(Parts, TEXT(", ")));
+			}
+		}
+
+		/* And a picture of it, for what the numbers can't say: -probecapture=<file stem>. Taken
+		 * from the front and the side against a mid grey wall, so a particle drawn black shows
+		 * up as black rather than as nothing. */
+		if (FString Stem; FParse::Value(*Params, TEXT("probecapture="), Stem) && !Stem.IsEmpty()) {
+			AActor* Holder = World->GetWorldSettings();
+
+			/* A wall behind the effect for each view, facing the camera */
+			UStaticMesh* Plane = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
+			UMaterialInterface* Unlit = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/EngineDebugMaterials/LevelColorationUnlitMaterial.LevelColorationUnlitMaterial"));
+			if (Plane != nullptr && Unlit != nullptr) {
+				UMaterialInstanceDynamic* Grey = UMaterialInstanceDynamic::Create(Unlit, Holder);
+				Grey->SetVectorParameterValue(TEXT("Color"), FLinearColor(0.25f, 0.25f, 0.25f));
+
+				for (const FTransform& Placed : { FTransform(FRotator(90, 0, 0), FVector(700, 0, 100), FVector(40)), FTransform(FRotator(90, -90, 0), FVector(0, -700, 100), FVector(40)) }) {
+					UStaticMeshComponent* Wall = NewObject<UStaticMeshComponent>(Holder);
+					Wall->SetStaticMesh(Plane);
+					Wall->SetMaterial(0, Grey);
+					Wall->SetWorldTransform(Placed);
+					Wall->RegisterComponentWithWorld(World);
+				}
+			}
+
+			UTextureRenderTarget2D* Target = NewObject<UTextureRenderTarget2D>();
+			Target->RenderTargetFormat = RTF_RGBA8_SRGB;
+			Target->InitAutoFormat(1024, 768);
+			Target->UpdateResourceImmediate(true);
+
+			USceneCaptureComponent2D* Capture = NewObject<USceneCaptureComponent2D>(Holder);
+			Capture->TextureTarget = Target;
+			Capture->CaptureSource = SCS_FinalColorLDR;
+			Capture->bCaptureEveryFrame = false;
+			Capture->bCaptureOnMovement = false;
+			Capture->FOVAngle = 90.0f;
+			/* Exposure held still, so the wall reads as the grey it is whatever the effect is doing */
+			Capture->PostProcessSettings.bOverride_AutoExposureMethod = true;
+			Capture->PostProcessSettings.AutoExposureMethod = AEM_Manual;
+			Capture->PostProcessSettings.bOverride_AutoExposureApplyPhysicalCameraExposure = true;
+			Capture->PostProcessSettings.AutoExposureApplyPhysicalCameraExposure = false;
+			Capture->PostProcessSettings.bOverride_AutoExposureBias = true;
+			Capture->PostProcessSettings.AutoExposureBias = 0.0f;
+			Capture->RegisterComponentWithWorld(World);
+
+			/* Everything the picture draws with, compiled before it is drawn */
+			GShaderCompilingManager->FinishAllCompilation();
+			FAssetCompilingManager::Get().FinishAllCompilation();
+
+			const TPair<const TCHAR*, FTransform> Views[] = {
+				{ TEXT("front"), FTransform(FRotator(0, 0, 0), FVector(-450, 0, 100)) },
+				{ TEXT("side"), FTransform(FRotator(0, -90, 0), FVector(0, 450, 100)) },
+			};
+
+			/* Taken at -probeseconds, then at each later time in -probelater=4,6,9 */
+			TArray<float> Times { Seconds };
+			if (FString Later; FParse::Value(*Params, TEXT("probelater="), Later, false)) {
+				TArray<FString> Listed;
+				Later.ParseIntoArray(Listed, TEXT(","));
+				for (const FString& Time : Listed) Times.Add(FCString::Atof(*Time));
+			}
+
+			float Now = Seconds;
+			for (const float Time : Times) {
+				if (Time > Now) {
+					Component->AdvanceSimulation(FMath::Max(1, FMath::RoundToInt((Time - Now) * 30.0f)), 1.0f / 30.0f);
+					Now = Time;
+					GShaderCompilingManager->FinishAllCompilation();
+				}
+
+				for (const TPair<const TCHAR*, FTransform>& View : Views) {
+					Capture->SetWorldTransform(View.Value);
+					Capture->CaptureScene();
+					FlushRenderingCommands();
+
+					TArray<FColor> Pixels;
+					if (!Target->GameThread_GetRenderTargetResource()->ReadPixels(Pixels) || Pixels.Num() == 0) {
+						UE_LOG(LogReflectImport, Error, TEXT("the %s capture came back empty"), View.Key);
+						continue;
+					}
+					for (FColor& Pixel : Pixels) Pixel.A = 255;
+
+					TArray64<uint8> Png;
+					FImageUtils::PNGCompressImageArray(Target->SizeX, Target->SizeY, TArrayView64<const FColor>(Pixels.GetData(), Pixels.Num()), Png);
+					const FString File = FString::Printf(TEXT("%s_%gs_%s.png"), *Stem, Now, View.Key);
+					if (FFileHelper::SaveArrayToFile(Png, *File)) {
+						UE_LOG(LogReflectImport, Display, TEXT("captured %s"), *File);
+					}
+				}
+			}
+		}
+
+		return 0;
+	}
+
+	if (int32 Checked = 0; RunMetaSoundCheck(Params, Checked)) return Checked;
 
 	/* Compiles a Niagara system already in the project and says what the compile said, without
 	 * importing or saving anything: -compilecheck=/Mount/Path/System */
@@ -487,6 +900,21 @@ int32 UReflectImportCommandlet::Main(const FString& Params) {
 		UE_LOG(LogReflectImport, Display, TEXT("reading \"%s\" rather than asking the cloud"), *From);
 	} else {
 		Response = Cloud::Export::GetRawBlocking(Path);
+
+		/* A project path, which a redirect moved from the path Cloud answers to: asked for at
+		 * each path that redirects there, the way re-reflecting an asset from the Content
+		 * Browser does */
+		if (!Response.IsValid() || !Response->HasField(TEXT("exports"))) {
+			for (const FString& Source : FRRedirects::Sources(Path)) {
+				TSharedPtr<FJsonObject> Answer = Cloud::Export::GetRawBlocking(Source);
+				if (!Answer.IsValid() || !Answer->HasField(TEXT("exports"))) continue;
+
+				UE_LOG(LogReflectImport, Display, TEXT("\"%s\" is read from \"%s\", the path the game keeps it at"), *Path, *Source);
+				Path = Source;
+				Response = MoveTemp(Answer);
+				break;
+			}
+		}
 	}
 
 	if (!Response.IsValid() || !Response->HasField(TEXT("exports"))) {
@@ -608,6 +1036,17 @@ int32 UReflectImportCommandlet::Main(const FString& Params) {
 
 		UE_LOG(LogReflectImport, Display, TEXT("%d graph(s), %d node(s), %d pin(s), %d link(s)"),
 			Graphs, Nodes, Pins, Links);
+
+		if (FString Dumped; FParse::Value(*Params, TEXT("graphdump="), Dumped) && !Dumped.IsEmpty()) {
+			IFileManager::Get().MakeDirectory(*Dumped, true);
+
+			for (UObject* Object : Held) {
+				/* Not the copies the compiler works on, which nobody opens */
+				if (const UEdGraph* Graph = Cast<UEdGraph>(Object); Graph != nullptr && Graph->Nodes.Num() > 0 && !Graph->HasAnyFlags(RF_Transient)) {
+					DumpGraph(Graph, Dumped);
+				}
+			}
+		}
 
 		/* The same again over every node in the package rather than only the ones a graph lists, so
 		 * a node a graph forgot shows up as the difference between the two */

@@ -4,6 +4,7 @@
 
 #include "Importers/Constructor/Asset.h"
 #include "Misc/PackageName.h"
+#include "Dom/JsonObject.h"
 
 #include "Settings/ReflectionSettings.h"
 #include "Settings/Runtime.h"
@@ -76,6 +77,52 @@ static bool HasOriginalAsset(const FString& Path) {
 		Registry.GetAssetsByPackageName(PackageName, Assets, true);
 	}
 	return Assets.ContainsByPredicate([](const FAssetData& Asset) { return !Asset.IsRedirector(); });
+}
+
+/* Whether a property rule is meant for this type, which it is for the one it names and any
+ * derived from it */
+static bool CoversType(const FRPropertyRedirect& Rule, const UStruct* Type) {
+	if (Rule.Type.IsEmpty()) return true;
+
+	for (const UStruct* Each = Type; Each != nullptr; Each = Each->GetSuperStruct()) {
+		if (Each->GetName() == Rule.Type) return true;
+	}
+
+	return false;
+}
+
+/* The first property rule that answers, going through the enabled redirectors in order */
+template <typename TPredicate>
+static const FRPropertyRedirect* FindPropertyRule(const UStruct* Type, TPredicate Answers) {
+	const UReflectionSettings* Settings = GetSettings();
+
+	if (Settings == nullptr || Type == nullptr) return nullptr;
+
+	for (const FRRedirector& Redirect : Settings->Redirectors) {
+		if (!Redirect.IsEnabled()) continue;
+
+		for (const FRPropertyRedirect& Rule : Redirect.Properties) {
+			if (!Rule.From.IsEmpty() && !Rule.To.IsEmpty() && CoversType(Rule, Type) && Answers(Rule)) {
+				return &Rule;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+TSharedPtr<FJsonValue> FRRedirects::RedirectedProperty(const UStruct* Type, const FString& Property, const FJsonObject& Fields) {
+	const FRPropertyRedirect* Found = FindPropertyRule(Type, [&Property, &Fields](const FRPropertyRedirect& Rule) {
+		return Rule.To == Property && Fields.HasField(Rule.From);
+	});
+
+	return Found != nullptr ? Fields.TryGetField(Found->From) : nullptr;
+}
+
+bool FRRedirects::PlacesField(const UStruct* Type, const FString& Field) {
+	return FindPropertyRule(Type, [Type, &Field](const FRPropertyRedirect& Rule) {
+		return Rule.From == Field && Type->FindPropertyByName(FName(*Rule.To)) != nullptr;
+	}) != nullptr;
 }
 
 void FRRedirects::Redirect(FString& Path, const FString& AlternatePackage) {
@@ -151,4 +198,65 @@ FRRedirectPreview FRRedirects::Preview(const FString& InPath) {
 
 void FRRedirects::Reverse(FString& Path) {
 	if (const FString* Original = History.Find(Path)) Path = *Original;
+}
+
+TArray<FString> FRRedirects::Sources(const FString& Path) {
+	TArray<FString> Found;
+
+	const auto Add = [&Found, &Path](const FString& Candidate) {
+		if (!Candidate.IsEmpty() && !Candidate.Equals(Path, ESearchCase::IgnoreCase)) Found.AddUnique(Candidate);
+	};
+
+	/* What this session moved, which is the answer where there is one */
+	if (const FString* Original = History.Find(Path)) Add(*Original);
+
+	/* Each point backwards, in the reverse of the order they are applied in, so a point that
+	 * works on what the one before it left is undone first. A point that didn't match is as
+	 * likely as one that did, so every path met along the way stays a candidate. */
+	if (const UReflectionSettings* Settings = GetSettings()) {
+		TArray<FString> Candidates { Path };
+
+		for (int32 At = Settings->Redirectors.Num() - 1; At >= 0; --At) {
+			const FRRedirector& Redirect = Settings->Redirectors[At];
+
+			if (!Redirect.IsEnabled()) continue;
+
+			for (int32 PointAt = Redirect.Points.Num() - 1; PointAt >= 0; --PointAt) {
+				const FRRedirectorPoint& Point = Redirect.Points[PointAt];
+
+				/* A point that takes something out leaves nothing to say what was there */
+				if (Point.To.IsEmpty() || Point.From.IsEmpty()) continue;
+
+				const int32 Known = Candidates.Num();
+
+				for (int32 Index = 0; Index < Known; ++Index) {
+					FString Back = Candidates[Index];
+
+					if (ApplyPoint(Back, Point.To, Point.From)) Candidates.AddUnique(Back);
+				}
+			}
+		}
+
+		/* Kept only where the redirect run forwards comes back to Path, which is the check that
+		 * a backwards point stood for what the forward one does */
+		for (const FString& Candidate : Candidates) {
+			if (Preview(Candidate).Path.Equals(Path, ESearchCase::IgnoreCase)) Add(Candidate);
+		}
+	}
+
+	/* And engine content, which lands in the engine content folder under its own mount. The folder
+	 * can be any depth, so each way of cutting the front off is tried and kept where it leads back. */
+	TArray<FString> Segments;
+	Path.ParseIntoArray(Segments, TEXT("/"));
+
+	for (int32 Cut = 1; Cut < Segments.Num(); ++Cut) {
+		const FString Candidate = TEXT("/") + FString::Join(TArrayView<const FString>(Segments).RightChop(Cut), TEXT("/"));
+
+		FString Destination;
+		if (FAssetUtilities::TryGetEngineContentDestination(Candidate, Destination) && Destination.Equals(Path, ESearchCase::IgnoreCase)) {
+			Add(Candidate);
+		}
+	}
+
+	return Found;
 }

@@ -65,6 +65,9 @@ protected:
 	/* Holds a parameter reading custom primitive data to the slots this engine has ~~~~~~~~~ */
 	static void ClampCustomPrimitiveDataIndex(UMaterialExpression* Expression);
 
+	/* Writes calls custom code makes to shader functions this engine lacks with ones it has ~~ */
+	static void RewriteMissingShaderCalls(UMaterialExpression* Expression);
+
 	/* Takes the pins for attributes this engine has no definition for off every get and set
 	 * material attributes node, and moves what read them off with them. Wants a wired graph, so
 	 * call it once the material's own inputs have been connected too.

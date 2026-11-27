@@ -1,6 +1,9 @@
 {
   "About": "What the import knows about source fields this engine's types don't have a property of the same name for. Read once per editor session. Aliases: a property this engine has, filled from a field the source calls something else (Type.Property: {From, Map}); Map turns the source value (an enum's leaf name, or a number or bool written as text) into this engine's, with * for anything else. Rebuilt: built data the importer has the engine make again from the imported asset (Type: {Fields, By}), reported on a line of its own as rebuilt, not left out. Ignored: fields that are not data to carry (the exporter's own header for an object, values the exporter works out from others, caches the editor rebuilds on load or compile), left out of the 'Fields this engine has no property for' report. A type's entries apply to the types derived from it; * applies to every type. Every other field the source has and this engine can't place is still reported by type and name.",
   "Aliases": {
+    "FortItemDefinition.DisplayName": { "From": "ItemName" },
+    "FortItemDefinition.Description": { "From": "ItemDescription" },
+    "FortItemDefinition.ShortDescription": { "From": "ItemShortDescription" },
     "PerPlatformInt.Default": { "From": "Value" },
     "PerPlatformFloat.Default": { "From": "Value" },
     "PerPlatformBool.Default": { "From": "Value" },

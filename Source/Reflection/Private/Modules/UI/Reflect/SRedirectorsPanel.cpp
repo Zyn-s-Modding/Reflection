@@ -99,7 +99,7 @@ void SRedirectorsPanel::Construct(const FArguments& InArgs) {
 			SNew(STextBlock)
 			.Text(LOCTEXT(
 				"What",
-				"An asset is fetched from the path it was queued under and written where these say. They run top to bottom, and each one works on what the one above it left, so dragging one up or down changes what it is given."
+				"An asset is fetched from the path it was queued under and written where these say. They run top to bottom, and each one works on what the one above it left, so dragging one up or down changes what it is given. Property rules read a field the export names one way into a property named another, and the first that matches is used."
 			))
 			.AutoWrapText(true)
 			.ColorAndOpacity(FSlateColor::UseSubduedForeground())
@@ -217,8 +217,17 @@ TSharedRef<SWidget> SRedirectorsPanel::BuildCard(const int32 Index) {
 		];
 	}
 
+	for (int32 At = 0; At < Redirect.Properties.Num(); ++At) {
+		Rules->AddSlot()
+		.AutoHeight()
+		.Padding(FMargin(0.0f, 1.0f))
+		[
+			BuildPropertyRule(Index, At)
+		];
+	}
+
 	/* A redirector with no rules reads as broken rather than new, so it says which it is */
-	if (Redirect.Points.Num() == 0) {
+	if (Redirect.Points.Num() == 0 && Redirect.Properties.Num() == 0) {
 		Rules->AddSlot()
 		.AutoHeight()
 		.Padding(FMargin(2.0f, 2.0f))
@@ -338,6 +347,17 @@ TSharedRef<SWidget> SRedirectorsPanel::BuildCard(const int32 Index) {
 					.ToolTipText(LOCTEXT("AddRuleTooltip", "Another From and To under this one. They are applied in order."))
 					.ContentPadding(FMargin(6.0f, 1.0f))
 					.OnClicked(this, &SRedirectorsPanel::OnAddRuleClicked, Index)
+				]
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(FMargin(4.0f, 0.0f, 0.0f, 0.0f))
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("AddPropertyRule", "Add Property Rule"))
+					.ToolTipText(LOCTEXT("AddPropertyRuleTooltip", "Read a field the export names one way into a property named another."))
+					.ContentPadding(FMargin(6.0f, 1.0f))
+					.OnClicked(this, &SRedirectorsPanel::OnAddPropertyRuleClicked, Index)
 				]
 
 				/* Which profiles it is for, since a redirector that is on and still doing nothing
@@ -465,6 +485,83 @@ TSharedRef<SWidget> SRedirectorsPanel::BuildRule(const int32 Index, const int32 
 		];
 }
 
+TSharedRef<SWidget> SRedirectorsPanel::BuildPropertyRule(const int32 Index, const int32 At) {
+	const UReflectionSettings* Settings = GetSettings();
+
+	if (Settings == nullptr || !Settings->Redirectors.IsValidIndex(Index)
+		|| !Settings->Redirectors[Index].Properties.IsValidIndex(At)) {
+		return SNullWidget::NullWidget;
+	}
+
+	const FRPropertyRedirect& Rule = Settings->Redirectors[Index].Properties[At];
+
+	const auto Box = [this, Index, At, &Rule](FString FRPropertyRedirect::* Member, const FText& Hint, const FText& Tooltip) {
+		return SNew(SEditableTextBox)
+			.HintText(Hint)
+			.ToolTipText(Tooltip)
+			.Text(FText::FromString(Rule.*Member))
+			.OnTextCommitted_Lambda([this, Index, At, Member](const FText& NewText, ETextCommit::Type) {
+				UReflectionSettings* Changed = GetSettings();
+
+				if (Changed == nullptr || !Changed->Redirectors.IsValidIndex(Index)) return;
+				if (!Changed->Redirectors[Index].Properties.IsValidIndex(At)) return;
+
+				Changed->Redirectors[Index].Properties[At].*Member = NewText.ToString().TrimStartAndEnd();
+
+				Commit();
+				Refresh();
+			});
+	};
+
+	return SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot()
+		.FillWidth(0.8f)
+		.VAlign(VAlign_Center)
+		.Padding(FMargin(0.0f, 0.0f, 6.0f, 0.0f))
+		[
+			Box(&FRPropertyRedirect::Type, LOCTEXT("TypeHint", "any type"),
+				LOCTEXT("TypeTooltip", "The class or struct this is kept to, and any derived from it, without the prefix, such as FortItemDefinition. Empty is every type."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.FillWidth(1.0f)
+		.VAlign(VAlign_Center)
+		[
+			Box(&FRPropertyRedirect::From, LOCTEXT("PropertyFromHint", "ExportField"),
+				LOCTEXT("PropertyFromTooltip", "The field as the export names it."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		.Padding(FMargin(6.0f, 0.0f))
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("ReadInto", "read into"))
+			.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+		]
+
+		+ SHorizontalBox::Slot()
+		.FillWidth(1.0f)
+		.VAlign(VAlign_Center)
+		[
+			Box(&FRPropertyRedirect::To, LOCTEXT("PropertyToHint", "PropertyHere"),
+				LOCTEXT("PropertyToTooltip", "The property in this project that takes it. Used only where the export has no field of this name."))
+		]
+
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		.Padding(FMargin(4.0f, 0.0f, 0.0f, 0.0f))
+		[
+			MakeCross(
+				LOCTEXT("RemovePropertyRuleTooltip", "Take this property rule out"),
+				FOnClicked::CreateSP(this, &SRedirectorsPanel::OnRemovePropertyRuleClicked, Index, At)
+			)
+		];
+}
+
 FText SRedirectorsPanel::EffectText(const int32 Index) const {
 	const UReflectionSettings* Settings = GetSettings();
 
@@ -481,6 +578,12 @@ FText SRedirectorsPanel::EffectText(const int32 Index) const {
 		return GReflectionRuntime.Profile.Name.IsEmpty()
 			? LOCTEXT("NoProfile", "waiting on a profile")
 			: FText::Format(LOCTEXT("NotThisProfileFmt", "not for {0}"), FText::FromString(GReflectionRuntime.Profile.Name));
+	}
+
+	/* One that only has property rules moves no paths, and a count of none would read as broken */
+	if (Redirect.Properties.Num() > 0
+		&& !Redirect.Points.ContainsByPredicate([](const FRRedirectorPoint& Point) { return !Point.From.IsEmpty(); })) {
+		return FText::GetEmpty();
 	}
 
 	if (!LandingPaths.IsBound()) return FText::GetEmpty();
@@ -618,6 +721,33 @@ FReply SRedirectorsPanel::OnRemoveRuleClicked(const int32 Index, const int32 At)
 	if (!Settings->Redirectors[Index].Points.IsValidIndex(At)) return FReply::Handled();
 
 	Settings->Redirectors[Index].Points.RemoveAt(At);
+
+	Commit();
+	Refresh();
+
+	return FReply::Handled();
+}
+
+FReply SRedirectorsPanel::OnAddPropertyRuleClicked(const int32 Index) {
+	UReflectionSettings* Settings = GetSettings();
+
+	if (Settings == nullptr || !Settings->Redirectors.IsValidIndex(Index)) return FReply::Handled();
+
+	Settings->Redirectors[Index].Properties.Add(FRPropertyRedirect());
+
+	Commit();
+	Refresh();
+
+	return FReply::Handled();
+}
+
+FReply SRedirectorsPanel::OnRemovePropertyRuleClicked(const int32 Index, const int32 At) {
+	UReflectionSettings* Settings = GetSettings();
+
+	if (Settings == nullptr || !Settings->Redirectors.IsValidIndex(Index)) return FReply::Handled();
+	if (!Settings->Redirectors[Index].Properties.IsValidIndex(At)) return FReply::Handled();
+
+	Settings->Redirectors[Index].Properties.RemoveAt(At);
 
 	Commit();
 	Refresh();

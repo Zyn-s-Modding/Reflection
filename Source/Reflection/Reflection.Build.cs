@@ -131,6 +131,31 @@ public class Reflection : ModuleRules {
 #endif
 		PrivateDefinitions.Add("REFLECTION_METASOUND_REGISTRY=" + (bMetaSoundRegistry ? "1" : "0"));
 
+		/* A MetaSound made in the editor carries an editor graph, which cooking strips. Without one
+		 * the MetaSound editor takes an asset for brand new when it is opened, and the cook leaves
+		 * out the pass that updates its nodes to this engine's. So an imported one is given a
+		 * graph, through the subsystem the editor's own factory uses, where that subsystem can set
+		 * one up for an existing document. */
+		var bMetaSoundEditorGraph = false;
+		if (bMetaSoundRegistry) {
+			var MetaSoundSource = Path.Combine(EngineDirectory, "Plugins", "Runtime", "Metasound", "Source");
+			var EditorSubsystem = Path.Combine(MetaSoundSource, "MetasoundEditor", "Public", "MetasoundEditorSubsystem.h");
+			var Generator = Path.Combine(MetaSoundSource, "MetasoundGenerator", "Public", "MetasoundGenerator.h");
+			bMetaSoundEditorGraph = File.Exists(EditorSubsystem) && File.ReadAllText(EditorSubsystem).Contains("void InitEdGraph(")
+				&& File.Exists(Generator) && File.ReadAllText(Generator).Contains("AddGraphSetCallback");
+		}
+		if (bMetaSoundEditorGraph) {
+			PrivateDependencyModuleNames.AddRange(new[] {
+				"MetasoundEngine",
+				"MetasoundEditor",
+
+				/* For the commandlet's check, which plays a MetaSound the way a cooked game would */
+				"MetasoundGenerator",
+				"AudioExtensions"
+			});
+		}
+		PrivateDefinitions.Add("REFLECTION_METASOUND_EDITOR_GRAPH=" + (bMetaSoundEditorGraph ? "1" : "0"));
+
 		var bNiagaraAllocationEstimator = false;
 #if UE_5_4_OR_LATER
 		var NiagaraSource = Path.Combine(EngineDirectory, "Plugins", "FX", "Niagara", "Source", "Niagara");
@@ -170,6 +195,8 @@ public class Reflection : ModuleRules {
 			"Niagara",
 #if UE_5_4_OR_LATER
 			"NiagaraShader",
+			/* FNiagaraCustomVersion, for the compiler version a script was compiled by */
+			"NiagaraCore",
 #endif
 			"UnrealEd",
 			"MainFrame",
@@ -212,6 +239,9 @@ public class Reflection : ModuleRules {
 			"Engine",
 			"Slate",
 			"SlateCore",
+
+			/* A renderer that draws nothing, for measuring graph nodes in a commandlet with no window */
+			"SlateNullRenderer",
 			"MaterialEditor",
 
 			/* SObjectPropertyEntryBox and the rest of the editor's asset pickers */

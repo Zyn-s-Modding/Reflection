@@ -1,0 +1,10 @@
+{
+  "About": "Shader functions that custom material expressions call and some engines don't define, and how the same call is written with a function an engine does define. Read once per editor session. A rule is used only where this engine's own shader sources (Engine/Shaders) never name the function, so an engine that has it keeps the call as the game wrote it. Becomes: the function to call instead. Arguments: which of the original call's arguments it takes, in order, counting from 0. A call with fewer arguments than a rule takes is left as written and reported.",
+  "Calls": {
+    "SceneTextureLookupCommon": {
+      "Becomes": "SceneTextureLookup",
+      "Arguments": [1, 2, 3],
+      "Why": "Later engines read a scene texture with SceneTextureLookupCommon(Parameters, UV, SceneTextureIndex, bFiltered). Engines without it read the same texture with SceneTextureLookup(UV, SceneTextureIndex, bFiltered)."
+    }
+  }
+}

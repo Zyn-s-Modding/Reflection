@@ -9,6 +9,8 @@
 #include "Importers/Types/Niagara/NiagaraScriptImporter.h"
 #include "NiagaraStatelessFallback.h"
 #include "Importers/Types/Niagara/NiagaraVersions.h"
+#include "NiagaraCustomVersion.h"
+#include "NiagaraDataInterface.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraScript.h"
 #include "NiagaraScriptSource.h"
@@ -206,6 +208,9 @@ bool INiagaraSystemImporter::RestoreSystem(UNiagaraSystem* System) const {
 	}
 
 #if UE5_1_BEYOND && WITH_EDITORONLY_DATA
+	/* Set where cooked compile results were thrown away below, so the system is compiled again */
+	bool bDiscardedCompiled = false;
+
 	UNiagaraScript* Spawn = System->GetSystemSpawnScript();
 	UNiagaraScript* Update = System->GetSystemUpdateScript();
 	if (Spawn == nullptr || Update == nullptr) {
@@ -288,31 +293,67 @@ bool INiagaraSystemImporter::RestoreSystem(UNiagaraSystem* System) const {
 	 * data interfaces, which asserts (Array index out of bounds, in
 	 * FNiagaraScriptExecutionParameterStore::AddScriptParams) and takes the editor down. Compiled
 	 * data like that is thrown away. The scripts compile again from their graphs on save anyway,
-	 * and the graphs have had those types taken out. */
+	 * and the graphs have had those types taken out.
+	 *
+	 * So is compiled code built for a data interface that keeps its per-instance data differently
+	 * here. The compiler passes an interface's per-instance slot as the first argument of every call
+	 * only where the interface kept per-instance data (UserPtrIdx), and the engine binds the calls
+	 * with the argument count that implies; one short or over fails a check in the interface's
+	 * GetVMExternalFunction as the script first builds its parameter store, which takes the editor
+	 * down. The interface's class can change on the way in (one a later engine added, read in as
+	 * the nearest one this engine has), so the type resolving is no sign the code still fits it.
+	 *
+	 * And so is compiled code another Niagara compiler made. Each result carries the version of the
+	 * compiler that produced it, and a script the engine loads with a different one is compiled
+	 * again (UNiagaraScript::PostLoad, "Niagara compiler version changed"). An imported script is
+	 * built rather than loaded, so that never happens to it: the game's code, from a later
+	 * compiler, is what runs, against modules and renderer bindings this engine reads differently.
+	 * The emitters it drew wrong (particles left black) are drawn right once compiled here. */
+	const FGuid ThisCompiler = FNiagaraCustomVersion::GetLatestScriptCompileVersion();
 	TArray<FString> Discarded;
+	TArray<FString> FromOtherCompiler;
 	for (FUObjectExport* Export : Container->Exports) {
 		UNiagaraScript* Cooked = Cast<UNiagaraScript>(Export->Object);
 		if (Cooked == nullptr) continue;
 		const FNiagaraVMExecutableData& CookedData = Cooked->GetVMExecutableData();
-		bool bUnknown = CookedData.DataInterfaceInfo.Num() != Cooked->GetCachedDefaultDataInterfaces().Num()
+		const TArray<FNiagaraScriptDataInterfaceInfo>& CachedInterfaces = Cooked->GetCachedDefaultDataInterfaces();
+		bool bStale = CookedData.DataInterfaceInfo.Num() != CachedInterfaces.Num()
 			|| CookedData.UObjectInfos.Num() != Cooked->GetCachedDefaultUObjects().Num();
 		for (const FNiagaraScriptDataInterfaceCompileInfo& Info : CookedData.DataInterfaceInfo) {
-			bUnknown |= !Info.Type.IsValid() || Info.Type.GetClass() == nullptr;
+			bStale |= !Info.Type.IsValid() || Info.Type.GetClass() == nullptr;
 		}
 		for (const FNiagaraVariable& Parameter : CookedData.Parameters.Parameters) {
-			bUnknown |= !Parameter.GetType().IsValid();
+			bStale |= !Parameter.GetType().IsValid();
 		}
-		for (const FNiagaraScriptDataInterfaceInfo& Cached : Cooked->GetCachedDefaultDataInterfaces()) {
-			bUnknown |= Cached.DataInterface == nullptr;
+		for (const FNiagaraScriptDataInterfaceInfo& Cached : CachedInterfaces) {
+			bStale |= Cached.DataInterface == nullptr;
 		}
-		if (!bUnknown) continue;
-		Cooked->InvalidateCompileResults(TEXT("compiled data names types this engine doesn't have"));
-		Discarded.Add(Cooked->GetName());
+		/* The cached interfaces are made one for one from the compiled list, in its order */
+		for (int32 Index = 0; !bStale && Index < CookedData.DataInterfaceInfo.Num(); ++Index) {
+			const bool bCompiledWithInstanceData = CookedData.DataInterfaceInfo[Index].UserPtrIdx != INDEX_NONE;
+			bStale |= bCompiledWithInstanceData != (CachedInterfaces[Index].DataInterface->PerInstanceDataSize() > 0);
+		}
+		if (bStale) {
+			Cooked->InvalidateCompileResults(TEXT("compiled data names types or data interface layouts this engine doesn't have"));
+			Discarded.Add(Cooked->GetName());
+			continue;
+		}
+
+		const FGuid CompiledBy = Cooked->GetVMExecutableDataCompilationId().CompilerVersionID;
+		if (CompiledBy.IsValid() && CompiledBy != ThisCompiler) {
+			Cooked->InvalidateCompileResults(TEXT("compiled by another Niagara compiler version"));
+			FromOtherCompiler.Add(Cooked->GetName());
+		}
 	}
 	if (Discarded.Num() > 0) {
-		FImportIssues::Report(EImportIssue::Data, TEXT("Cooked Niagara compile results named types this engine doesn't have and were discarded"),
+		FImportIssues::Report(EImportIssue::Data, TEXT("Cooked Niagara compile results named types or data interface layouts this engine doesn't have and were discarded"),
 			FString::Printf(TEXT("%s. These scripts are compiled again from their graphs"), *FString::Join(Discarded, TEXT(", "))));
 	}
+	if (FromOtherCompiler.Num() > 0) {
+		FImportIssues::Report(EImportIssue::Data, TEXT("Cooked Niagara compile results came from another Niagara compiler version and were discarded"),
+			FString::Printf(TEXT("%d script(s). These are compiled again from their graphs, as the engine does when it loads an asset compiled by another version"), FromOtherCompiler.Num()));
+	}
+	bDiscardedCompiled = Discarded.Num() > 0 || FromOtherCompiler.Num() > 0;
 
 	/* The system compiles when it is saved, and a GPU emitter whose compute script comes out of
 	 * that compile without a base compile hash fails a check in FNiagaraShaderScript::SetScript,
@@ -372,6 +413,10 @@ bool INiagaraSystemImporter::RestoreSystem(UNiagaraSystem* System) const {
 				EditorData->SynchronizeOverviewGraphWithSystem(*System);
 			}
 			System->RequestCompile(true);
+		} else if (bDiscardedCompiled) {
+			/* Nothing else asks for it before the save, and a system saved with its compile results
+			 * thrown away runs nothing until something does */
+			System->RequestCompile(false);
 		}
 #endif
 #if UE5_4_BEYOND

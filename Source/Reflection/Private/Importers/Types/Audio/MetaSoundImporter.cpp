@@ -6,6 +6,11 @@
 #include "MetasoundFrontendSearchEngine.h"
 #endif
 
+#if REFLECTION_METASOUND_EDITOR_GRAPH
+#include "Importers/Constructor/Asset.h"
+#include "Importers/Types/Audio/MetaSoundEditorGraph.h"
+#endif
+
 #if ENGINE_UE5
 namespace {
 	const TSharedPtr<FJsonObject>* MetaSoundObject(const TSharedPtr<FJsonObject>& Object, const TCHAR* Field) {
@@ -151,6 +156,18 @@ namespace {
 			const FStructProperty* Property = FindFProperty<FStructProperty>(Asset->GetClass(), TEXT("RootMetasoundDocument"));
 			if (Property != nullptr && Property->Struct == FMetasoundFrontendDocument::StaticStruct()) {
 				RepairMetaSoundDocument(*Property->ContainerPtrToValuePtr<FMetasoundFrontendDocument>(Asset));
+
+#if REFLECTION_METASOUND_EDITOR_GRAPH
+				/* Last, once the document is what it is going to be: the graph is drawn from it.
+				 * Any MetaSound it uses that an earlier import left without a graph is mended and
+				 * saved along with it, since opening this one opens those too. */
+				TArray<UObject*> Repaired;
+				EnsureMetaSoundEditorGraph(Asset, &Repaired);
+				for (UObject* Used : Repaired) {
+					UPackage* Package = Used->GetOutermost();
+					if (FAssetUtilities::IsAllowedDestination(Package->GetName())) FAssetUtilities::QueueSave(Package);
+				}
+#endif
 			}
 		}
 #endif

@@ -17,6 +17,7 @@
 #include "EdGraphUtilities.h"
 #include "Animation/AnimNode_TransitionResult.h"
 #include "Serializers/ObjectSerializer.h"
+#include "Importers/Types/Blueprint/GraphLayout.h"
 
 inline void AutoLayoutStateMachineGraph(UAnimationStateMachineGraph* StateMachineGraph)  {
     if (!StateMachineGraph) { 
@@ -82,35 +83,149 @@ inline void AutoLayoutStateMachineGraph(UAnimationStateMachineGraph* StateMachin
         }
     }
     
-    TMap<int32, TArray<UAnimStateNodeBase*>> StatesByLevel;
-    for (auto& Pair : StateLevels) {
-        UAnimStateNodeBase* State = Pair.Key;
-        int32 Level = Pair.Value;
-    	
-        StatesByLevel.FindOrAdd(Level).Add(State);
-    }
+    /* A state nothing reaches from the entry still has to go somewhere. Each one starts a level count
+     * of its own from wherever is left, so it and whatever it leads to are laid out the same way, in a
+     * band of their own under the rest rather than piled on the origin. */
+    TArray<TArray<UAnimStateNodeBase*>> Bands;
+    {
+        TArray<UAnimStateNodeBase*> Reached;
+        for (const TPair<UAnimStateNodeBase*, int32>& Pair : StateLevels) Reached.Add(Pair.Key);
+        Bands.Add(Reached);
 
-    constexpr float HorizontalSpacing = 400.0f;
-    constexpr float VerticalSpacing = 200.0f;
-	
-    for (auto& LevelGroup : StatesByLevel) {
-        int32 Level = LevelGroup.Key;
-        TArray<UAnimStateNodeBase*>& NodesInLevel = LevelGroup.Value;
-    	
-        NodesInLevel.Sort([](const UAnimStateNodeBase& A, const UAnimStateNodeBase& B) {
-            return A.GetName() < B.GetName();
-        });
-    	
-        const float X = Level * HorizontalSpacing;
-        float StartY = -((NodesInLevel.Num() - 1) * VerticalSpacing) * 0.5f;
-    	
-        for (int32 i = 0; i < NodesInLevel.Num(); ++i) {
-            UAnimStateNodeBase* Node = NodesInLevel[i];
-            Node->NodePosX = X;
-            Node->NodePosY = StartY + i * VerticalSpacing;
+        for (UEdGraphNode* Node : StateMachineGraph->Nodes) {
+            UAnimStateNodeBase* Lost = Cast<UAnimStateNodeBase>(Node);
+            if (!Lost || Lost->IsA<UAnimStateTransitionNode>() || StateLevels.Contains(Lost)) continue;
+
+            TArray<UAnimStateNodeBase*> Band;
+            StateLevels.Add(Lost, 0);
+            NodesToProcess.Enqueue(Lost);
+            Band.Add(Lost);
+
+            while (!NodesToProcess.IsEmpty()) {
+                UAnimStateNodeBase* Current;
+                NodesToProcess.Dequeue(Current);
+
+                if (const TArray<UAnimStateNodeBase*>* Next = OutgoingTransitions.Find(Current)) {
+                    for (UAnimStateNodeBase* NextState : *Next) {
+                        if (StateLevels.Contains(NextState)) continue;
+
+                        StateLevels.Add(NextState, StateLevels.FindChecked(Current) + 1);
+                        NodesToProcess.Enqueue(NextState);
+                        Band.Add(NextState);
+                    }
+                }
+            }
+
+            Bands.Add(Band);
         }
     }
-    
+
+    /* Where each state comes from, for ordering a column by what leads into it */
+    TMap<UAnimStateNodeBase*, TArray<UAnimStateNodeBase*>> IncomingTransitions;
+    for (const TPair<UAnimStateNodeBase*, TArray<UAnimStateNodeBase*>>& Pair : OutgoingTransitions) {
+        for (UAnimStateNodeBase* To : Pair.Value) IncomingTransitions.FindOrAdd(To).AddUnique(Pair.Key);
+    }
+
+    /* Room between columns for the transition icons and the arrows round them, and between states */
+    constexpr double ColumnGap = 180.0;
+    constexpr double RowGap = 70.0;
+    constexpr double BandGap = 240.0;
+
+    double BandTop = 0.0;
+
+    for (const TArray<UAnimStateNodeBase*>& Band : Bands) {
+        if (Band.Num() == 0) continue;
+
+        TMap<int32, TArray<UAnimStateNodeBase*>> StatesByLevel;
+        int32 Deepest = 0;
+
+        for (UAnimStateNodeBase* State : Band) {
+            const int32 Level = StateLevels.FindChecked(State);
+            StatesByLevel.FindOrAdd(Level).Add(State);
+            Deepest = FMath::Max(Deepest, Level);
+        }
+
+        /* Each column in the order of what leads into it from the column before, so the transitions
+         * between them cross as little as they can. Two sweeps settle most of it. */
+        TMap<UAnimStateNodeBase*, double> Rank;
+        for (const TPair<int32, TArray<UAnimStateNodeBase*>>& Pair : StatesByLevel) {
+            for (int32 Index = 0; Index < Pair.Value.Num(); ++Index) Rank.Add(Pair.Value[Index], Index);
+        }
+
+        for (int32 Sweep = 0; Sweep < 2; ++Sweep) {
+            for (int32 Level = 1; Level <= Deepest; ++Level) {
+                TArray<UAnimStateNodeBase*>* Column = StatesByLevel.Find(Level);
+                if (!Column) continue;
+
+                TMap<UAnimStateNodeBase*, double> Wants;
+                for (UAnimStateNodeBase* State : *Column) {
+                    double Sum = 0.0;
+                    int32 Count = 0;
+
+                    if (const TArray<UAnimStateNodeBase*>* From = IncomingTransitions.Find(State)) {
+                        for (UAnimStateNodeBase* One : *From) {
+                            const int32* OneLevel = StateLevels.Find(One);
+                            if (OneLevel && *OneLevel < Level && Rank.Contains(One)) {
+                                Sum += Rank[One];
+                                Count++;
+                            }
+                        }
+                    }
+
+                    Wants.Add(State, Count > 0 ? Sum / Count : Rank[State]);
+                }
+
+                Column->StableSort([&Wants](const UAnimStateNodeBase& A, const UAnimStateNodeBase& B) {
+                    return Wants[&A] < Wants[&B];
+                });
+
+                for (int32 Index = 0; Index < Column->Num(); ++Index) Rank.Add((*Column)[Index], Index);
+            }
+        }
+
+        /* Measured, since a state is as wide as its name and the widest one decides the column */
+        TMap<UAnimStateNodeBase*, FVector2D> Sizes;
+        for (UAnimStateNodeBase* State : Band) Sizes.Add(State, MeasureGraphNode(State).Size);
+
+        TArray<double> ColumnHeight;
+        ColumnHeight.SetNumZeroed(Deepest + 1);
+        double Tallest = 0.0;
+
+        for (const TPair<int32, TArray<UAnimStateNodeBase*>>& Pair : StatesByLevel) {
+            double Height = 0.0;
+            for (UAnimStateNodeBase* State : Pair.Value) Height += Sizes[State].Y + RowGap;
+
+            ColumnHeight[Pair.Key] = FMath::Max(0.0, Height - RowGap);
+            Tallest = FMath::Max(Tallest, ColumnHeight[Pair.Key]);
+        }
+
+        double Left = 0.0;
+
+        for (int32 Level = 0; Level <= Deepest; ++Level) {
+            const TArray<UAnimStateNodeBase*>* Column = StatesByLevel.Find(Level);
+            if (!Column) continue;
+
+            double Widest = 0.0;
+            for (UAnimStateNodeBase* State : *Column) Widest = FMath::Max(Widest, Sizes[State].X);
+
+            /* Centred on the band's tallest column, so a column of one sits level with the middle */
+            double Top = BandTop + (Tallest - ColumnHeight[Level]) * 0.5;
+
+            for (UAnimStateNodeBase* State : *Column) {
+                const FVector2D& Size = Sizes[State];
+
+                State->NodePosX = FMath::RoundToInt(Left + (Widest - Size.X) * 0.5);
+                State->NodePosY = FMath::RoundToInt(Top);
+
+                Top += Size.Y + RowGap;
+            }
+
+            Left += Widest + ColumnGap;
+        }
+
+        BandTop += Tallest + BandGap;
+    }
+
     for (UEdGraphNode* Node : StateMachineGraph->Nodes) {
         UAnimStateTransitionNode* TransitionNode = Cast<UAnimStateTransitionNode>(Node);
         if (!TransitionNode) { 

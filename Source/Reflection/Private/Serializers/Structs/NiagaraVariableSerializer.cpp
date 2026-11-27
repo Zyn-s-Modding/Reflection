@@ -6,6 +6,7 @@
 
 #include "Engine/Compatibility.h"
 #include "Importers/Constructor/Importer.h"
+#include "Utilities/AssetPaths.h"
 
 #include "NiagaraTypes.h"
 
@@ -79,7 +80,13 @@ namespace {
 		} else if (Kind == UnderlyingEnum) {
 			UEnum* Enum = Full.IsEmpty() ? nullptr : FindObject<UEnum>(nullptr, *Full);
 			if (Enum == nullptr && Module.StartsWith(TEXT("/")) && !Module.StartsWith(TEXT("/Script/"))) {
-				const FString PackagePath = Module.Contains(TEXT(".")) ? Module.Left(Module.Find(TEXT("."))) : Module;
+				/* The export names the package where the game keeps the enum, and the project keeps
+				 * its copy where the redirects put it, so it is looked for there, the way every other
+				 * reference is. Looked for under the game's path, the project's copy was never found
+				 * and the enum was fetched and imported again over it partway through the run, and
+				 * scripts loaded from disk in the meantime lost it: their static switches came out
+				 * with no enum and the graphs calling them failed to compile. */
+				const FString PackagePath = ToEditorPackagePath(Module.Contains(TEXT(".")) ? Module.Left(Module.Find(TEXT("."))) : Module);
 				Enum = LoadObjectByPath<UEnum>(PackagePath + TEXT(".") + Leaf);
 				if (Enum == nullptr) {
 					Enum = Cast<UEnum>(IImporter::DownloadWrapper(TObjectPtr<UObject>(), TEXT("UserDefinedEnum"), Leaf, PackagePath).Get());

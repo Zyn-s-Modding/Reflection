@@ -1,6 +1,7 @@
 /* Copyright Reflection Contributors 2024-2026 */
 
 #include "Importers/Types/Blueprint/AnimationBlueprintImporter.h"
+#include "Importers/Types/Blueprint/GraphLayout.h"
 #include "Importers/Types/Blueprint/BlueprintCompile.h"
 #include "AnimGraphNode_BlendListByInt.h"
 #include "AnimGraphNode_TwoWayBlend.h"
@@ -838,6 +839,13 @@ bool IAnimationBlueprintImporter::Import() {
 
 	/* Opened on whatever mesh the folder keeps, since the cook drops what it was previewed on */
 	FPreviewMesh::FromFolder(AnimBlueprint, AnimBlueprint->TargetSkeleton);
+
+	/* Built as far as it goes. Whatever the compiler would still not take is mended or taken out, so
+	 * the class keeps everything else it does rather than being left with empty functions. */
+	RepairBlueprintCompile(AnimBlueprint);
+
+	/* And laid out again at the sizes the nodes finally came out at */
+	RelayoutBlueprintGraphs(AnimBlueprint);
 
 	/* The same half built class the ordinary blueprint importer guards against, which an animation
 	 * blueprint reaches by its own road */

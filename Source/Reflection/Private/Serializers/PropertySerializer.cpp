@@ -9,6 +9,8 @@
 #include "Importers/Constructor/Importer.h"
 #include "Serializers/ObjectSerializer.h"
 #include "UObject/TextProperty.h"
+#include "Internationalization/StringTableCore.h"
+#include "Internationalization/StringTableRegistry.h"
 #include "Misc/Base64.h"
 
 /* Struct Serializers */
@@ -63,6 +65,113 @@ namespace {
 
 		UObject* Object;
 	};
+
+	/* An entry of a string table, kept as a reference to the table where the table can be had.
+	 *
+	 * The table is an asset, and its id is where it is kept, so it is brought in where the project
+	 * has not got it. A reference to a table or an entry that isn't there shows as missing, so
+	 * without one the words the export carries are used instead. */
+	bool ReadStringTableText(const FJsonObject& Fields, FString Table, FText& Out) {
+		FString Key;
+		Fields.TryGetStringField(TEXT("Key"), Key);
+
+		if (FString Package, Name; Table.StartsWith(TEXT("/")) && Table.Split(TEXT("."), &Package, &Name, ESearchCase::CaseSensitive, ESearchDir::FromEnd)) {
+			Package = ToEditorPackagePath(Package);
+			Table = Package + TEXT(".") + Name;
+
+			if (LoadObjectByPath<UObject>(Table) == nullptr) {
+				IImporter::DownloadWrapper(TObjectPtr<UObject>(), TEXT("StringTable"), Name, Package);
+
+				/* Loaded for the registry to find it by */
+				LoadObjectByPath<UObject>(Table);
+			}
+		}
+
+		if (const FStringTableConstPtr Held = FStringTableRegistry::Get().FindStringTable(FName(*Table)); Held.IsValid() && Held->FindEntry(Key).IsValid()) {
+			Out = FText::FromStringTable(FName(*Table), Key);
+
+			return true;
+		}
+
+		FString Words;
+
+		if (!Fields.TryGetStringField(TEXT("SourceString"), Words) && !Fields.TryGetStringField(TEXT("LocalizedString"), Words)) {
+			return false;
+		}
+
+		FImportIssues::Report(EImportIssue::Data, TEXT("String table text was imported as plain text, since its table entry isn't here"),
+			FString::Printf(TEXT("%s: %s"), *Table, *Key));
+
+		Out = FText::FromString(Words);
+
+		return true;
+	}
+
+	/* Text, which an export writes as the pieces it was made from and each kind carries its own */
+	bool ReadText(const TSharedPtr<FJsonValue>& Value, FText& Out) {
+		if (!Value.IsValid() || Value->IsNull()) return false;
+
+		/* Written the way the engine writes text out, or as the words alone */
+		if (Value->Type == EJson::String) {
+			const FString Written = Value->AsString();
+
+			if (Written.IsEmpty()) {
+				Out = FText::GetEmpty();
+			} else if (FTextStringHelper::ReadFromBuffer(*Written, Out) == nullptr) {
+				Out = FText::FromString(Written);
+			}
+
+			return true;
+		}
+
+		const TSharedPtr<FJsonObject>* Fields = nullptr;
+
+		if (!Value->TryGetObject(Fields)) return false;
+
+		/* The same in every language, and written as null where it says nothing */
+		if ((*Fields)->HasField(TEXT("CultureInvariantString"))) {
+			FString Words;
+			(*Fields)->TryGetStringField(TEXT("CultureInvariantString"), Words);
+
+			Out = Words.IsEmpty() ? FText::GetEmpty() : FText::AsCultureInvariant(Words);
+
+			return true;
+		}
+
+		if (FString Table; (*Fields)->TryGetStringField(TEXT("TableId"), Table)) {
+			return ReadStringTableText(**Fields, Table, Out);
+		}
+
+		if (FString Words; (*Fields)->TryGetStringField(TEXT("SourceString"), Words)) {
+			FString Namespace;
+			FString Key;
+			(*Fields)->TryGetStringField(TEXT("Namespace"), Namespace);
+			(*Fields)->TryGetStringField(TEXT("Key"), Key);
+
+#if UE5_8_BEYOND
+			/* ForUseOnlyByLocMacroAndGraphNodeTextLiterals_CreateText was removed in 5.8 */
+			Out = FText::FromString(Words);
+#else
+			Out = Key.IsEmpty()
+				? FText::FromString(Words)
+				: FInternationalization::ForUseOnlyByLocMacroAndGraphNodeTextLiterals_CreateText(*Words, *Namespace, *Key);
+#endif
+
+			return true;
+		}
+
+		/* Made from another text, by filling in a pattern or changing its case. What was filled in
+		 * isn't rebuilt, but the words it was made from are kept */
+		for (const TCHAR* From : { TEXT("SourceFmt"), TEXT("SourceText") }) {
+			if ((*Fields)->HasField(From) && ReadText((*Fields)->TryGetField(From), Out)) {
+				FImportIssues::Report(EImportIssue::Data, TEXT("Formatted text was imported as the text it was made from"), Out.ToString());
+
+				return true;
+			}
+		}
+
+		return false;
+	}
 }
 
 /* A tag the game had and this project has not. */
@@ -1222,30 +1331,10 @@ void UPropertySerializer::DeserializePropertyValue(FProperty* Property, const TS
 		*static_cast<FName*>(OutValue) = *NameString;
 	}
 	else if (const FTextProperty* TextProperty = CastField<const FTextProperty>(Property)) {
-		const FString SerializedValue = NewJsonValue->AsString();
-		
-		if (!SerializedValue.IsEmpty()) {
-			FTextStringHelper::ReadFromBuffer(*SerializedValue, *static_cast<FText*>(OutValue));
-		} else {
-			/* TODO: Somehow add other needed things like Namespace, Key, and LocalizedString */
-			TSharedPtr<FJsonObject> Object = NewJsonValue->AsObject().ToSharedRef();
-
-			/* Retrieve properties */
-			FString TextNamespace = Object->GetStringField(TEXT("Namespace"));
-			FString UniqueKey = Object->GetStringField(TEXT("Key"));
-			FString SourceString = Object->GetStringField(TEXT("SourceString"));
-			FString CultureInvariantString = Object->GetStringField(TEXT("CultureInvariantString"));
-
-			if (Object->HasField(TEXT("CultureInvariantString"))) {
-				TextProperty->SetPropertyValue(OutValue, FText::FromString(*Object->GetStringField(TEXT("CultureInvariantString"))));
-			} else {
-	#if UE5_8_BEYOND
-				/* ForUseOnlyByLocMacroAndGraphNodeTextLiterals_CreateText was removed in 5.8 */
-				TextProperty->SetPropertyValue(OutValue, FText::FromString(SourceString));
-	#else
-				TextProperty->SetPropertyValue(OutValue, FInternationalization::ForUseOnlyByLocMacroAndGraphNodeTextLiterals_CreateText(*SourceString, *TextNamespace, *UniqueKey));
-	#endif
-			}
+		if (FText Read; ReadText(NewJsonValue, Read)) {
+			TextProperty->SetPropertyValue(OutValue, Read);
+		} else if (!NewJsonValue->IsNull()) {
+			FImportIssues::Report(EImportIssue::Data, TEXT("Text could not be read, and was left as it was built"), Property->GetName());
 		}
 	}
 	/* FFieldPath, and the property type that holds one, came in with FField in 4.25. A property

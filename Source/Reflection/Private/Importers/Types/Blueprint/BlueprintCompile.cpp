@@ -19,6 +19,21 @@
 #include "Kismet/KismetNodeHelperLibrary.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "Kismet2/CompilerResultsLog.h"
+#include "Logging/TokenizedMessage.h"
+#include "Misc/UObjectToken.h"
+#include "K2Node_DynamicCast.h"
+#include "K2Node_ClassDynamicCast.h"
+#include "K2Node_MakeArray.h"
+#include "K2Node_Event.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"
+#include "K2Node_Tunnel.h"
+#include "K2Node_MacroInstance.h"
+#include "K2Node_Composite.h"
+#include "K2Node_Timeline.h"
+#include "AnimGraphNode_Base.h"
+#include "EdGraphNode_Comment.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/FeedbackContext.h"
 #include "Misc/SlowTask.h"
@@ -67,6 +82,22 @@ namespace {
 #else
 		FKismetEditorUtilities::CompileBlueprint(Blueprint, Options);
 
+		return true;
+#endif
+	}
+
+	/* The same again, with what the compiler said kept rather than only written to the log */
+	bool AttemptLogged(UBlueprint* Blueprint, const EBlueprintCompileOptions Options, FCompilerResultsLog* Results) {
+#if PLATFORM_WINDOWS && !PLATFORM_SEH_EXCEPTIONS_DISABLED
+		__try {
+			FKismetEditorUtilities::CompileBlueprint(Blueprint, Options, Results);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+#else
+		FKismetEditorUtilities::CompileBlueprint(Blueprint, Options, Results);
 		return true;
 #endif
 	}
@@ -725,6 +756,234 @@ static void SettleEffectComponents(const UBlueprint* Blueprint) {
 	 * it would be saved still saying it is the old shape, and every load and every compile after that
 	 * would make its components out of the old settings all over again, beside the ones it has. */
 	if (Shape != nullptr) *Shape = NewestEffectVersion();
+}
+
+/* What is left of a blueprint whose compile failed on a few nodes, made to compile.
+ *
+ * A blueprint does not compile a node at a time. One node the compiler will not take fails the whole
+ * class, and a class that failed is given nothing but empty functions, so every function in it does
+ * nothing at all. The nodes that fail are almost always the far end of something this build has not
+ * got: a call into a class it lacks is left out, and whatever took that call's answer is left with
+ * nothing, a cast with nothing to cast or an array with nothing in it.
+ *
+ * Each node the compiler complained about is first given the least that lets it compile and keep its
+ * place: a cast nothing feeds is told it casts an object, which is none and fails the cast the way
+ * the missing answer would have, and an array nothing feeds is handed an empty one. A node that
+ * still will not compile after that is taken out, and the run through it is joined up past it, so
+ * the class loses that one node rather than everything it does. Whatever is done is said out loud. */
+int32 RepairBlueprintCompile(UBlueprint* Blueprint, const EBlueprintCompileOptions Options) {
+	if (Blueprint == nullptr) return 0;
+
+	const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+
+	TSet<const UEdGraphNode*> Mended;
+
+	int32 Changed = 0;
+
+	/* The nodes the compiler named in what it complained about, read off what it said rather than off
+	 * the nodes. It marks a node only where the fault is in the node itself: a macro whose expansion
+	 * fails has the fault put on what it expanded into, which is not in any graph anybody keeps. */
+	TMap<const UEdGraphNode*, FString> Named;
+
+	const auto CompileListening = [&]() {
+		Named.Reset();
+
+		FCompilerResultsLog Results;
+		Results.bAnnotateMentionedNodes = true;
+		Results.SetSourcePath(Blueprint->GetPathName());
+
+		const bool bRan = AttemptLogged(Blueprint, Options, &Results);
+
+		for (const TSharedRef<FTokenizedMessage>& Message : Results.Messages) {
+			if (Message->GetSeverity() != EMessageSeverity::Error) continue;
+
+			for (const TSharedRef<IMessageToken>& Token : Message->GetMessageTokens()) {
+				if (Token->GetType() != EMessageToken::Object) continue;
+
+				UObject* Mentioned = StaticCastSharedRef<FUObjectToken>(Token)->GetObject().Get();
+				const UEdGraphNode* Node = Cast<UEdGraphNode>(Mentioned);
+
+				if (Node == nullptr) continue;
+
+				/* What it was expanded from, where it was expanded from anything */
+				if (const UEdGraphNode* Instance = Cast<UEdGraphNode>(Results.FindSourceMacroInstance(Node))) {
+					Node = Instance;
+				} else if (const UEdGraphNode* Source = Cast<UEdGraphNode>(Results.FindSourceObject(Mentioned))) {
+					Node = Source;
+				}
+
+				if (Node->GetTypedOuter<UBlueprint>() == Blueprint && !Named.Contains(Node)) {
+					Named.Add(Node, Message->ToText().ToString());
+				}
+			}
+		}
+
+		return bRan;
+	};
+
+	if (Blueprint->Status == BS_Error) CompileListening();
+
+	for (int32 Round = 0; Round < 6 && Blueprint->Status == BS_Error; ++Round) {
+		TArray<UEdGraph*> Graphs;
+		Blueprint->GetAllGraphs(Graphs);
+
+		TArray<TPair<UEdGraph*, UEdGraphNode*>> Failing;
+
+		for (UEdGraph* Graph : Graphs) {
+			if (Graph == nullptr) continue;
+
+			for (UEdGraphNode* Node : Graph->Nodes) {
+				if (Node == nullptr) continue;
+
+				bool bFails = Named.Contains(Node) || (Node->bHasCompilerMessage && Node->ErrorType <= EMessageSeverity::Error);
+
+				/* Or one taking something of no kind in particular that nothing decides. The compiler
+				 * says so about whatever the node expands into rather than the node, so a macro left
+				 * that way is never the one complained about, and it fails every compile all the same. */
+				for (const UEdGraphPin* Pin : Node->Pins) {
+					if (bFails) break;
+
+					if (Pin != nullptr && Pin->Direction == EGPD_Input && !Pin->bHidden && Pin->LinkedTo.Num() == 0
+						&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard) {
+						bFails = true;
+					}
+				}
+
+				if (bFails) Failing.Add(TPair<UEdGraph*, UEdGraphNode*>(Graph, Node));
+			}
+		}
+
+		if (Failing.Num() == 0) break;
+
+		int32 ThisRound = 0;
+
+		for (const TPair<UEdGraph*, UEdGraphNode*>& One : Failing) {
+			UEdGraph* Graph = One.Key;
+			UEdGraphNode* Node = One.Value;
+
+			const FString Said = Named.Contains(Node) ? Named[Node] : Node->ErrorMsg;
+			const FString Title = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+
+			/* Given what lets it compile, once. A second complaint means that was not what it lacked. */
+			if (!Mended.Contains(Node)) {
+				bool bMended = false;
+
+				if (UK2Node_DynamicCast* Casting = Cast<UK2Node_DynamicCast>(Node)) {
+					UEdGraphPin* Source = Casting->GetCastSourcePin();
+
+					if (Source != nullptr && Source->LinkedTo.Num() == 0 && Source->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard) {
+						Source->PinType.PinCategory = Node->IsA<UK2Node_ClassDynamicCast>() ? UEdGraphSchema_K2::PC_Class : UEdGraphSchema_K2::PC_Object;
+						Source->PinType.PinSubCategoryObject = UObject::StaticClass();
+
+						bMended = true;
+					}
+				}
+
+				for (UEdGraphPin* Pin : TArray<UEdGraphPin*>(Node->Pins)) {
+					if (Pin == nullptr || Pin->Direction != EGPD_Input || Pin->bHidden || Pin->LinkedTo.Num() > 0 || !Pin->PinType.IsArray()) continue;
+
+					/* An array of nothing in particular cannot be handed an empty one either */
+					if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard) continue;
+
+					UK2Node_MakeArray* Empty = NewObject<UK2Node_MakeArray>(Graph, NAME_None, RF_Transactional);
+
+					Graph->AddNode(Empty, false, false);
+
+					Empty->CreateNewGuid();
+					Empty->PostPlacedNewNode();
+					Empty->NumInputs = 0;
+					Empty->AllocateDefaultPins();
+
+					Empty->NodePosX = Node->NodePosX - 160;
+					Empty->NodePosY = Node->NodePosY;
+
+					if (UEdGraphPin* Out = Empty->GetOutputPin()) {
+						Out->PinType = Pin->PinType;
+						Out->PinType.bIsReference = false;
+
+						Schema->TryCreateConnection(Out, Pin);
+					}
+
+					bMended = true;
+				}
+
+				if (bMended) {
+					Mended.Add(Node);
+					ThisRound++;
+
+					FImportIssues::Report(
+						EImportIssue::Data,
+						FString::Printf(TEXT("A node in \"%s\" was given what it lacked to compile"), *Blueprint->GetName()),
+						FString::Printf(TEXT("%s in \"%s\": %s"), *Title, *Graph->GetName(), *Said)
+					);
+
+					continue;
+				}
+			}
+
+			/* What a graph is entered and left through, and what it is, stay whatever they say */
+			/* A macro placed in a graph is a tunnel by type and goes like any other node; the ways in and
+			 * out of a macro or a collapsed graph, and the collapsed graph itself, are what hold it up */
+			const bool bHoldsUp = (Node->IsA<UK2Node_Tunnel>() && !Node->IsA<UK2Node_MacroInstance>()) || Node->IsA<UK2Node_Composite>();
+
+			if (Node->IsA<UK2Node_FunctionEntry>() || Node->IsA<UK2Node_FunctionResult>() || Node->IsA<UK2Node_Event>()
+				|| bHoldsUp || Node->IsA<UK2Node_Timeline>() || Node->IsA<UAnimGraphNode_Base>() || Node->IsA<UEdGraphNode_Comment>()) {
+				continue;
+			}
+
+			/* The run carries on past it, from wherever led into it to wherever it goes on to when it
+			 * is done: its plain way out where it has one, or where it goes once it has finished, which
+			 * for a loop with nothing to go round is straight past the body. */
+			TArray<UEdGraphPin*> Into;
+			TArray<UEdGraphPin*> OnTo;
+
+			const UEdGraphPin* Onward = Node->FindPin(UEdGraphSchema_K2::PN_Then, EGPD_Output);
+
+			if (Onward == nullptr) Onward = Node->FindPin(TEXT("Completed"), EGPD_Output);
+
+			for (const UEdGraphPin* Pin : Node->Pins) {
+				if (Pin == nullptr || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec) continue;
+
+				if (Pin->Direction == EGPD_Input) {
+					Into.Append(Pin->LinkedTo);
+				} else if (Onward == nullptr && OnTo.Num() == 0) {
+					OnTo.Append(Pin->LinkedTo);
+				}
+			}
+
+			if (Onward != nullptr && Onward->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) OnTo.Append(Onward->LinkedTo);
+
+			Node->BreakAllNodeLinks();
+			Graph->RemoveNode(Node);
+
+			for (UEdGraphPin* From : Into) {
+				for (UEdGraphPin* To : OnTo) {
+					if (From != nullptr && To != nullptr) Schema->TryCreateConnection(From, To);
+				}
+			}
+
+			ThisRound++;
+
+			FImportIssues::Report(
+				EImportIssue::Data,
+				FString::Printf(TEXT("A node in \"%s\" would not compile and was taken out"), *Blueprint->GetName()),
+				FString::Printf(TEXT("%s in \"%s\": %s"), *Title, *Graph->GetName(), *Said)
+			);
+		}
+
+		if (ThisRound == 0) break;
+
+		Changed += ThisRound;
+
+		if (!CompileListening()) break;
+	}
+
+	if (Changed > 0) {
+		UE_LOG(LogReflection, Display, TEXT("\"%s\": %d node(s) mended or taken out so it compiles, and it %s"),
+			*Blueprint->GetName(), Changed, Blueprint->Status == BS_Error ? TEXT("still does not") : TEXT("now does"));
+	}
+
+	return Changed;
 }
 
 bool CompileBlueprintGuarded(UBlueprint* Blueprint, const EBlueprintCompileOptions Options) {

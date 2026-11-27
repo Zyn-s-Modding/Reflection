@@ -7,6 +7,7 @@
 #include "Importers/Types/Blueprint/MacroPattern.h"
 
 class UEdGraph;
+class UEdGraphNode;
 class UK2Node_FunctionResult;
 class UEdGraphPin;
 class UK2Node;
@@ -326,6 +327,9 @@ private:
 
 	/* Event nodes by the address their function enters at, moved into place as the walk reaches it */
 	TMap<int32, TArray<TWeakObjectPtr<UK2Node>>> Sitting;
+
+	/* What the graph already held when a stretch was laid into it, which stays where it was put */
+	TArray<TWeakObjectPtr<UEdGraphNode>> Standing;
 
 
 	/* Statements that only say where a run begins, and stand for nothing in a graph */

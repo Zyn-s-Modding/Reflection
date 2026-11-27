@@ -55,6 +55,10 @@ private:
 	void HandleExports(const TArray<TSharedPtr<FJsonValue>>& Exports);
 	void Finish();
 
+	/* Asks Cloud for Paths from At on, one after another, and hands over the first export list
+	 * that isn't empty, or the last answer where none has any */
+	static void FetchFirstHeld(TArray<FString> Paths, int32 At, TFunction<void(const TArray<TSharedPtr<FJsonValue>>&)> OnExports);
+
 	/* Object paths rather than asset pointers: a run spans many ticks, and holding a UObject*
 	 * across them would only be safe by accident */
 	TArray<FString> Queue;

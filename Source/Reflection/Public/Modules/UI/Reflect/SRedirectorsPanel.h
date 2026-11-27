@@ -52,6 +52,9 @@ private:
 	/* One From and To pair, which is the only part of a redirect that does anything */
 	TSharedRef<SWidget> BuildRule(int32 Index, int32 At);
 
+	/* One property rule: a type, and the field read into the property of another name */
+	TSharedRef<SWidget> BuildPropertyRule(int32 Index, int32 At);
+
 	/* What this one does to the queue, or why it is doing nothing to it */
 	FText EffectText(int32 Index) const;
 
@@ -64,6 +67,8 @@ private:
 	FReply OnRemoveRedirectorClicked(int32 Index);
 	FReply OnAddRuleClicked(int32 Index);
 	FReply OnRemoveRuleClicked(int32 Index, int32 At);
+	FReply OnAddPropertyRuleClicked(int32 Index);
+	FReply OnRemovePropertyRuleClicked(int32 Index, int32 At);
 
 	/* Written to the settings and reported on, which is the same two steps for every edit here */
 	void Commit();

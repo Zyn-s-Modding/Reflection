@@ -795,6 +795,13 @@ namespace {
 
 		bool bComplete = true;
 		const TCHAR* const Channels[] = {TEXT("XChannelDistribution"), TEXT("YChannelDistribution"), TEXT("ZChannelDistribution"), TEXT("WChannelDistribution")};
+		/* Each channel of a set can be switched off on its own. The 5.4 module writes every channel
+		 * of a set it writes unless told not to, and puts its own input default (0) in the ones the
+		 * stateless module was told to leave alone, where the particle would otherwise keep the
+		 * attribute's default (1). A material reading such a channel as a brightness then draws
+		 * black (the pixel spheres in NS_Emote_PeonyPizza_Bursts). A flag the export leaves out is
+		 * the class default, from the data file. */
+		const TCHAR* const ChannelFlags[] = {TEXT("bXChannelEnabled"), TEXT("bYChannelEnabled"), TEXT("bZChannelEnabled"), TEXT("bWChannelEnabled")};
 		for (int32 Index = 0; Index < 4; ++Index) {
 			const FJsonObject* Parameters = ObjectField(Properties, *FString::Printf(TEXT("Parameter%d"), Index));
 			if (Parameters == nullptr) continue;
@@ -803,9 +810,25 @@ namespace {
 			bComplete &= SetSwitch(Node, *FString::Printf(TEXT("Write Parameter Index %d"), Index), FString(bEnabled ? TEXT("true") : TEXT("false")));
 			if (!bEnabled) continue;
 			for (int32 Channel = 0; Channel < UE_ARRAY_COUNT(Channels); ++Channel) {
+				const FString Write = FString::Printf(TEXT("Index%dParam%dWrite"), Index, Channel);
+
+				bool bChannelOn = true;
+				bool bChannelKnown = Parameters->TryGetBoolField(ChannelFlags[Channel], bChannelOn);
+				if (!bChannelKnown) {
+					const FDefault FlagDefault = DefaultFor(ChannelFlags[Channel]);
+					if (FlagDefault.bSet) {
+						bChannelOn = FlagDefault.Value.X != 0;
+						bChannelKnown = true;
+					}
+				}
+				if (bChannelKnown && !bChannelOn) {
+					bComplete &= SetLiteral(Node, *Write, FVector4f(0, 0, 0, 0));
+					continue;
+				}
+
 				const FJsonObject* Distribution = ObjectField(*Parameters, Channels[Channel]);
 				if (!HasDistributionValue(Distribution)) continue;
-				bComplete &= SetLiteral(Node, *FString::Printf(TEXT("Index%dParam%dWrite"), Index, Channel), FVector4f(1, 1, 1, 1));
+				bComplete &= SetLiteral(Node, *Write, FVector4f(1, 1, 1, 1));
 				bComplete &= SetDistribution(Node, *FString::Printf(TEXT("Index %d Param %d"), Index, Channel + 1), Distribution);
 			}
 		}

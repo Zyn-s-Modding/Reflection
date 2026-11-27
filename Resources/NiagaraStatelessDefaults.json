@@ -22,6 +22,10 @@
     "LightAttributes.FalloffExponent": { "Value": 1 },
     "LightAttributes.DiffuseScale": { "Value": 1 },
     "LightAttributes.SpecularScale": { "Value": 1 },
-    "LightAttributes.VolumetricScattering": { "Value": 1 }
+    "LightAttributes.VolumetricScattering": { "Value": 1 },
+    "DynamicMaterialParameters.bXChannelEnabled": { "Value": 1 },
+    "DynamicMaterialParameters.bYChannelEnabled": { "Value": 1 },
+    "DynamicMaterialParameters.bZChannelEnabled": { "Value": 1 },
+    "DynamicMaterialParameters.bWChannelEnabled": { "Value": 1 }
   }
 }

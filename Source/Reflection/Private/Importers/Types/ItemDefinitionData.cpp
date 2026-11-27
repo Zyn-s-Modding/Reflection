@@ -18,6 +18,7 @@ namespace {
 		{ TEXT("Rarity"),    TEXT("Rarity")            },
 		{ TEXT("MinLevel"),  TEXT("MinLevel")          },
 		{ TEXT("MaxLevel"),  TEXT("MaxLevel")          },
+		{ TEXT("SearchTags"), TEXT("SearchTags")       },
 	};
 }
 

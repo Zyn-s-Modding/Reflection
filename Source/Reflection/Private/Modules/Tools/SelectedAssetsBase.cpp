@@ -8,6 +8,7 @@
 #include "Modules/Cloud/Cloud.h"
 #include "Modules/UI/StyleModule.h"
 #include "Engine/EngineUtilities.h"
+#include "Settings/Redirector.h"
 
 void TSelectedAssetsBase::Execute() {
 	if (bRunning) {
@@ -72,15 +73,35 @@ void TSelectedAssetsBase::RequestNext() {
 		return;
 	}
 
+	/* The asset is where it sits in this project, which a redirect may have moved it to from where
+	 * the game keeps it, and Cloud only answers to the game's path. So it is asked for where it
+	 * is, then at each path that redirects here, until Cloud has one. */
+	TArray<FString> Paths { Queue[QueueIndex] };
+	FString Package = Queue[QueueIndex];
+	if (int32 Dot; Package.FindChar(TEXT('.'), Dot)) Package.LeftInline(Dot);
+	Paths.Append(FRRedirects::Sources(Package));
+
 	/* One request at a time: Process deserializes into live assets, and the tools were written
 	 * expecting to be the only thing doing that */
-	Cloud::Export::GetRawExportsAsync(Queue[QueueIndex], [this](const TArray<TSharedPtr<FJsonValue>>& Exports) {
+	FetchFirstHeld(MoveTemp(Paths), 0, [this](const TArray<TSharedPtr<FJsonValue>>& Exports) {
 		/* Copied out of the response, which does not outlive a deferred call */
 		const TArray<TSharedPtr<FJsonValue>> OwnedExports = Exports;
 
 		Cloud::RunWhenSafe([this, OwnedExports]() {
 			HandleExports(OwnedExports);
 		});
+	});
+}
+
+void TSelectedAssetsBase::FetchFirstHeld(TArray<FString> Paths, const int32 At, TFunction<void(const TArray<TSharedPtr<FJsonValue>>&)> OnExports) {
+	Cloud::Export::GetRawExportsAsync(Paths[At], [Paths, At, OnExports](const TArray<TSharedPtr<FJsonValue>>& Exports) {
+		if (Exports.Num() > 0 || !Paths.IsValidIndex(At + 1)) {
+			OnExports(Exports);
+
+			return;
+		}
+
+		FetchFirstHeld(Paths, At + 1, OnExports);
 	});
 }
 

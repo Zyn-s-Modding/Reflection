@@ -1,6 +1,8 @@
 /* Copyright Reflection Contributors 2024-2026 */
 
 #include "Importers/Types/UserDefined/UserDefinedStructImporter.h"
+#include "Importers/Constructor/ImportIssues.h"
+#include "EdGraphSchema_K2.h"
 
 #include "UserDefinedStructure/UserDefinedStructEditorData.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -120,6 +122,67 @@ bool IUserDefinedStructImporter::Import() {
 
     for (const TSharedPtr<FJsonObject>& Described : Members) {
         AddMemberToStruct(UserDefinedStruct, Described, MemberMetaData);
+    }
+
+    /* A member whose type is a struct or class nothing could be found for is kept as a plain object.
+     *
+     * The compiler skips a member it cannot make a property for and then goes looking for the
+     * property it skipped, which it treats as the struct having been taken apart under it: it stops
+     * the editor on the spot, or in a commandlet hangs it for good. Left out instead, a struct whose
+     * members all name what this build has not got comes out empty, an empty struct is not a type,
+     * and every blueprint holding one fails to compile over it. Kept under its own name as the one
+     * kind that always exists, the struct and everything holding it compile, and whatever read the
+     * member is left to say it wanted something else. */
+    {
+        const auto NeedsObject = [](const FName Category) {
+            return Category == UEdGraphSchema_K2::PC_Struct || Category == UEdGraphSchema_K2::PC_Object || Category == UEdGraphSchema_K2::PC_Class
+                || Category == UEdGraphSchema_K2::PC_SoftObject || Category == UEdGraphSchema_K2::PC_SoftClass || Category == UEdGraphSchema_K2::PC_Interface;
+        };
+
+        /* The kind a lost type is kept as: a class stays a class, everything else is an object */
+        const auto Keep = [](const FName Category) {
+            if (Category == UEdGraphSchema_K2::PC_Class || Category == UEdGraphSchema_K2::PC_SoftClass) return Category;
+            if (Category == UEdGraphSchema_K2::PC_SoftObject) return Category;
+
+            return UEdGraphSchema_K2::PC_Object;
+        };
+
+        TArray<FString> Kept;
+
+        for (FStructVariableDescription& One : FStructureEditorUtils::GetVarDesc(UserDefinedStruct)) {
+            bool bLost = false;
+
+            if (NeedsObject(One.Category) && One.SubCategoryObject.LoadSynchronous() == nullptr) {
+                One.Category = Keep(One.Category);
+                One.SubCategory = NAME_None;
+                One.SubCategoryObject = UObject::StaticClass();
+                One.DefaultValue.Empty();
+                One.CurrentDefaultValue.Empty();
+
+                bLost = true;
+            }
+
+            if (One.ContainerType == EPinContainerType::Map && NeedsObject(One.PinValueType.TerminalCategory) && One.PinValueType.TerminalSubCategoryObject.Get() == nullptr) {
+                One.PinValueType.TerminalCategory = Keep(One.PinValueType.TerminalCategory);
+                One.PinValueType.TerminalSubCategory = NAME_None;
+                One.PinValueType.TerminalSubCategoryObject = UObject::StaticClass();
+
+                bLost = true;
+            }
+
+            if (bLost) Kept.Add(One.FriendlyName.IsEmpty() ? One.VarName.ToString() : One.FriendlyName);
+        }
+
+        if (Kept.Num() > 0) {
+            UE_LOG(LogReflection, Warning, TEXT("\"%s\": %d member(s) of a type this build could not find were kept as plain objects: %s"),
+                *UserDefinedStruct->GetName(), Kept.Num(), *FString::Join(Kept, TEXT(", ")));
+
+            FImportIssues::Report(
+                EImportIssue::Data,
+                FString::Printf(TEXT("Members of \"%s\" were kept as plain objects"), *UserDefinedStruct->GetName()),
+                FString::Printf(TEXT("Their type is a struct or class that could not be found or imported, so they hold an object instead: %s"), *FString::Join(Kept, TEXT(", ")))
+            );
+        }
     }
 
     /* One compile for the whole layout. Compiling per member reinstances every struct and

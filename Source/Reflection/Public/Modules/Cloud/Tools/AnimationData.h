@@ -405,6 +405,22 @@ inline bool ReadAnimationData(USerializerContainer* Container, const bool UseSel
 			);
 		}
 
+#if UE5_2_BEYOND
+		/* The montage is given its length here, with its notifies set aside.
+		 *
+		 * The engine takes a montage getting longer for time put in at the front of it, and moves every
+		 * notify along by as much. Left at the nothing it was made with, the length is first worked out
+		 * when the montage is saved, which moves every notify to the end of it. */
+		if (const float Length = Montage->CalculateSequenceLength(); Length > 0.0f) {
+			TArray<FAnimNotifyEvent> Aside = MoveTemp(Montage->Notifies);
+			Montage->Notifies.Reset();
+
+			Montage->SetCompositeLength(Length);
+
+			Montage->Notifies = MoveTemp(Aside);
+		}
+#endif
+
 		for (FAnimNotifyEvent& Notify : Montage->Notifies) {
 			Notify.RefreshSegmentOnLoad();
 			Notify.Link(Montage, Notify.GetTime());

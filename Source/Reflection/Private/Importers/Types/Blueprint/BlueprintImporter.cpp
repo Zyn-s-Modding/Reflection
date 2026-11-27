@@ -3,6 +3,7 @@
 #include "Importers/Types/Blueprint/BlueprintImporter.h"
 #include "Importers/Types/Blueprint/WidgetTreeSource.h"
 #include "Engine/Package.h"
+#include "Importers/Types/Blueprint/GraphLayout.h"
 #include "Importers/Types/Blueprint/BlueprintCompile.h"
 #include "AnimationGraphSchema.h"
 #include "AnimGraphNode_Root.h"
@@ -262,6 +263,13 @@ bool IBlueprintImporter::Import() {
 	 * a graph that is not there. Saving harvests one set of references and then writes another, and
 	 * the package save says so every time. */
 	Blueprint->LastEditedDocuments.Empty();
+
+	/* Built as far as it goes. Whatever the compiler would still not take is mended or taken out, so
+	 * the class keeps everything else it does rather than being left with empty functions. */
+	RepairBlueprintCompile(Blueprint);
+
+	/* And laid out again at the sizes the nodes finally came out at */
+	RelayoutBlueprintGraphs(Blueprint);
 
 	/* A compile that failed said so and left the package transient, meaning to write nothing. This
 	 * is the other half of that: handing a half built class on calls PostEditChange on it, and the
